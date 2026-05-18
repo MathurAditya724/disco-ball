@@ -2,251 +2,170 @@ import { useRef, useMemo, useEffect } from "react";
 import { useFrame } from "@react-three/fiber";
 import { Environment } from "@react-three/drei";
 import * as THREE from "three";
+import { SVGLoader } from "three/examples/jsm/loaders/SVGLoader.js";
 
-const DEPTH = 0.5;
-const TILE_SIZE = 0.085;
-const GAP_FRACTION = 0.84;
+const DEPTH = 0.6;
+const TILE_SIZE = 0.1;
+const TILE_GAP = 0.012;
+const SVG_SCALE = 0.1;
 
-/**
- * Build the Sentry logo as THREE.Shape objects.
- *
- * The Sentry logo consists of:
- * 1. An outer chevron/triangle - two thick legs meeting at an apex,
- *    the left leg curves into the bottom-left, the right leg has a
- *    short horizontal foot at bottom-right.
- * 2. A middle arc (larger) curving from bottom-left upward
- * 3. An inner arc (smaller) curving similarly
- *
- * The arcs share a center near the bottom-left of the triangle.
- * The overall shape resembles a stylized "A" with sound-wave arcs.
- */
-function buildSentryShapes(): THREE.Shape[] {
+const SENTRY_SVG_PATH =
+  "M29,2.26a4.67,4.67,0,0,0-8,0L14.42,13.53A32.21,32.21,0,0,1,32.17,40.19H27.55A27.68,27.68,0,0,0,12.09,17.47L6,28a15.92,15.92,0,0,1,9.23,12.17H4.62A.76.76,0,0,1,4,39.06l2.94-5a10.74,10.74,0,0,0-3.36-1.9l-2.91,5a4.54,4.54,0,0,0,1.69,6.24A4.66,4.66,0,0,0,4.62,44H19.15a19.4,19.4,0,0,0-8-17.31l2.31-4A23.87,23.87,0,0,1,23.76,44H36.07a35.88,35.88,0,0,0-16.41-31.8l4.67-8a.77.77,0,0,1,1.05-.27c.53.29,20.29,34.77,20.66,35.17a.76.76,0,0,1-.68,1.13H40.6q.09,1.91,0,3.81h4.78A4.59,4.59,0,0,0,50,39.43a4.49,4.49,0,0,0-.62-2.28Z";
+
+function parseSentryShapes(): THREE.Shape[] {
+  const loader = new SVGLoader();
+  const svgData = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 44"><path d="${SENTRY_SVG_PATH}"/></svg>`;
+  const data = loader.parse(svgData);
+
   const shapes: THREE.Shape[] = [];
-  const sw = 0.30;
-
-  // --- Part 1: Outer chevron ---
-  {
-    const shape = new THREE.Shape();
-
-    // Outer triangle vertices
-    const apexX = 0, apexY = 2.5;
-    const leftX = -2.15, leftY = -1.4;
-    const rightX = 2.15, rightY = -1.4;
-
-    // Compute inner offset for thick stroke
-    // Left leg: from apex to bottom-left
-    const lDx = leftX - apexX, lDy = leftY - apexY;
-    const lLen = Math.sqrt(lDx * lDx + lDy * lDy);
-    const lPerpX = -lDy / lLen, lPerpY = lDx / lLen;
-
-    // Right leg: from apex to bottom-right
-    const rDx = rightX - apexX, rDy = rightY - apexY;
-    const rLen = Math.sqrt(rDx * rDx + rDy * rDy);
-    const rPerpX = rDy / rLen, rPerpY = -rDx / rLen;
-
-    // Foot lengths
-    const footH = 0.50;
-
-    // Outer path: apex -> bottom-left -> foot -> inner-left up to inner-apex -> inner-right down to foot -> bottom-right -> back to apex
-    shape.moveTo(apexX, apexY);
-    shape.lineTo(leftX, leftY);
-    // Left foot (horizontal segment going right)
-    shape.lineTo(leftX + footH, leftY);
-    // Inner left leg going up to inner apex
-    const innerApexX = apexX + lPerpX * sw + rPerpX * sw;
-    const innerApexY = apexY + lPerpY * sw * 0.55 + rPerpY * sw * 0.55;
-    shape.lineTo(innerApexX, innerApexY);
-    // Inner right leg going down
-    shape.lineTo(rightX - footH, rightY);
-    // Right foot
-    shape.lineTo(rightX, rightY);
-    // Close back to apex
-    shape.lineTo(apexX, apexY);
-
-    shapes.push(shape);
+  for (const path of data.paths) {
+    const pathShapes = SVGLoader.createShapes(path);
+    shapes.push(...pathShapes);
   }
-
-  // --- Part 2: Middle arc ---
-  {
-    const shape = new THREE.Shape();
-    // Arc center is at the bottom-left area (where the left leg meets the ground)
-    const cx = -0.68, cy = -1.4;
-    const outerR = 1.72;
-    const innerR = outerR - sw;
-    const startAngle = 0.06;
-    const endAngle = Math.PI * 0.48;
-    const segments = 48;
-
-    // Outer arc
-    for (let i = 0; i <= segments; i++) {
-      const t = startAngle + (endAngle - startAngle) * (i / segments);
-      const x = cx + outerR * Math.cos(t);
-      const y = cy + outerR * Math.sin(t);
-      if (i === 0) shape.moveTo(x, y);
-      else shape.lineTo(x, y);
-    }
-    // Inner arc (reverse)
-    for (let i = segments; i >= 0; i--) {
-      const t = startAngle + (endAngle - startAngle) * (i / segments);
-      shape.lineTo(cx + innerR * Math.cos(t), cy + innerR * Math.sin(t));
-    }
-    shape.closePath();
-    shapes.push(shape);
-  }
-
-  // --- Part 3: Inner (smallest) arc ---
-  {
-    const shape = new THREE.Shape();
-    const cx = -0.68, cy = -1.4;
-    const outerR = 0.98;
-    const innerR = outerR - sw;
-    const startAngle = 0.08;
-    const endAngle = Math.PI * 0.44;
-    const segments = 36;
-
-    for (let i = 0; i <= segments; i++) {
-      const t = startAngle + (endAngle - startAngle) * (i / segments);
-      const x = cx + outerR * Math.cos(t);
-      const y = cy + outerR * Math.sin(t);
-      if (i === 0) shape.moveTo(x, y);
-      else shape.lineTo(x, y);
-    }
-    for (let i = segments; i >= 0; i--) {
-      const t = startAngle + (endAngle - startAngle) * (i / segments);
-      shape.lineTo(cx + innerR * Math.cos(t), cy + innerR * Math.sin(t));
-    }
-    shape.closePath();
-    shapes.push(shape);
-  }
-
   return shapes;
 }
 
-function isPointInShapes(px: number, py: number, shapes: THREE.Shape[]): boolean {
-  for (const shape of shapes) {
-    if (isPointInShape(px, py, shape)) return true;
+function isPointInShapes(
+  px: number,
+  py: number,
+  polygons: THREE.Vector2[][]
+): boolean {
+  for (const poly of polygons) {
+    if (isPointInPolygon(px, py, poly)) return true;
   }
   return false;
 }
 
-function isPointInShape(px: number, py: number, shape: THREE.Shape): boolean {
-  const pts = shape.getPoints(80);
+function isPointInPolygon(
+  px: number,
+  py: number,
+  polygon: THREE.Vector2[]
+): boolean {
   let inside = false;
-  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-    const xi = pts[i].x, yi = pts[i].y;
-    const xj = pts[j].x, yj = pts[j].y;
-    if (((yi > py) !== (yj > py)) &&
-      (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x,
+      yi = polygon[i].y;
+    const xj = polygon[j].x,
+      yj = polygon[j].y;
+    if (yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
       inside = !inside;
     }
   }
   return inside;
 }
 
-function generateAllTiles(shapes: THREE.Shape[]): THREE.Matrix4[] {
-  const matrices: THREE.Matrix4[] = [];
-  const tileStep = TILE_SIZE / GAP_FRACTION;
-  const halfDepth = DEPTH / 2;
-  const tileSize = TILE_SIZE;
+function shapesToPolygons(shapes: THREE.Shape[]): THREE.Vector2[][] {
+  return shapes.map((shape) => shape.getPoints(120));
+}
 
-  // Bounding box
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const shape of shapes) {
-    const pts = shape.getPoints(80);
-    for (const p of pts) {
-      minX = Math.min(minX, p.x);
-      maxX = Math.max(maxX, p.x);
-      minY = Math.min(minY, p.y);
-      maxY = Math.max(maxY, p.y);
+function generateTileMatrices(
+  shapes: THREE.Shape[],
+  centerX: number,
+  centerY: number
+): THREE.Matrix4[] {
+  const matrices: THREE.Matrix4[] = [];
+  const tileStep = TILE_SIZE + TILE_GAP;
+  const halfDepth = DEPTH / 2;
+  const polygons = shapesToPolygons(shapes);
+
+  // Bounding box in scaled SVG coordinates
+  let minX = Infinity,
+    maxX = -Infinity,
+    minY = Infinity,
+    maxY = -Infinity;
+  for (const poly of polygons) {
+    for (const p of poly) {
+      minX = Math.min(minX, p.x * SVG_SCALE);
+      maxX = Math.max(maxX, p.x * SVG_SCALE);
+      minY = Math.min(minY, p.y * SVG_SCALE);
+      maxY = Math.max(maxY, p.y * SVG_SCALE);
     }
   }
 
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
+  // Scale polygons for hit testing in world space
+  const scaledPolygons = polygons.map((poly) =>
+    poly.map((p) => new THREE.Vector2(p.x * SVG_SCALE, p.y * SVG_SCALE))
+  );
 
-  // Front face tiles
+  // --- Front face (normal +Z) ---
   for (let x = minX; x <= maxX; x += tileStep) {
     for (let y = minY; y <= maxY; y += tileStep) {
-      if (!isPointInShapes(x, y, shapes)) continue;
+      if (!isPointInShapes(x, y, scaledPolygons)) continue;
       const mat = new THREE.Matrix4();
       mat.compose(
-        new THREE.Vector3(x - cx, y - cy, halfDepth + 0.002),
+        new THREE.Vector3(x - centerX, -(y - centerY), halfDepth + 0.004),
         new THREE.Quaternion(),
-        new THREE.Vector3(tileSize, tileSize, 1)
+        new THREE.Vector3(TILE_SIZE, TILE_SIZE, 1)
       );
       matrices.push(mat);
     }
   }
 
-  // Back face tiles
+  // --- Back face (normal -Z) ---
   const backQ = new THREE.Quaternion().setFromAxisAngle(
-    new THREE.Vector3(0, 1, 0), Math.PI
+    new THREE.Vector3(0, 1, 0),
+    Math.PI
   );
   for (let x = minX; x <= maxX; x += tileStep) {
     for (let y = minY; y <= maxY; y += tileStep) {
-      if (!isPointInShapes(x, y, shapes)) continue;
+      if (!isPointInShapes(x, y, scaledPolygons)) continue;
       const mat = new THREE.Matrix4();
       mat.compose(
-        new THREE.Vector3(x - cx, y - cy, -halfDepth - 0.002),
+        new THREE.Vector3(x - centerX, -(y - centerY), -halfDepth - 0.004),
         backQ,
-        new THREE.Vector3(tileSize, tileSize, 1)
+        new THREE.Vector3(TILE_SIZE, TILE_SIZE, 1)
       );
       matrices.push(mat);
     }
   }
 
-  // Side (edge) tiles along each shape outline
-  for (const shape of shapes) {
-    const pts = shape.getPoints(250);
-    for (let i = 0; i < pts.length; i++) {
-      const a = pts[i];
-      const b = pts[(i + 1) % pts.length];
+  // --- Side faces (along outlines) ---
+  for (const poly of scaledPolygons) {
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i];
+      const b = poly[(i + 1) % poly.length];
       const eDx = b.x - a.x;
       const eDy = b.y - a.y;
       const eLen = Math.sqrt(eDx * eDx + eDy * eDy);
       if (eLen < 0.001) continue;
 
+      // Outward normal (2D perpendicular)
       const nx = -eDy / eLen;
       const ny = eDx / eLen;
 
-      const tilesAlongEdge = Math.max(1, Math.floor(eLen / tileStep));
-      const tilesAlongDepth = Math.max(1, Math.floor(DEPTH / tileStep));
+      const tilesAlongEdge = Math.max(1, Math.round(eLen / tileStep));
+      const tilesAlongDepth = Math.max(1, Math.round(DEPTH / tileStep));
+
+      const edgeTileW = (eLen / tilesAlongEdge) * (TILE_SIZE / tileStep);
+      const edgeTileH = (DEPTH / tilesAlongDepth) * (TILE_SIZE / tileStep);
 
       for (let ei = 0; ei < tilesAlongEdge; ei++) {
         const t = (ei + 0.5) / tilesAlongEdge;
-        const ex = a.x + eDx * t - cx;
-        const ey = a.y + eDy * t - cy;
+        const ex = a.x + eDx * t - centerX;
+        const ey = -(a.y + eDy * t - centerY);
 
         for (let di = 0; di < tilesAlongDepth; di++) {
           const dt = (di + 0.5) / tilesAlongDepth;
           const ez = -halfDepth + DEPTH * dt;
 
-          const px = ex + nx * 0.002;
-          const py = ey + ny * 0.002;
+          const px = ex + nx * 0.004;
+          const py = ey - ny * 0.004;
 
-          const angle = Math.atan2(ny, nx);
-          const q = new THREE.Quaternion().setFromAxisAngle(
-            new THREE.Vector3(0, 0, 1), angle
-          ).multiply(
-            new THREE.Quaternion().setFromAxisAngle(
-              new THREE.Vector3(0, 1, 0), Math.PI / 2
-            )
-          );
-
-          const sideTileH = Math.min(
-            tileSize,
-            (DEPTH / tilesAlongDepth) * GAP_FRACTION
-          );
-          const sideTileW = Math.min(
-            tileSize,
-            (eLen / tilesAlongEdge) * GAP_FRACTION
-          );
+          const angle = Math.atan2(-ny, nx);
+          const q = new THREE.Quaternion()
+            .setFromAxisAngle(new THREE.Vector3(0, 0, 1), angle)
+            .multiply(
+              new THREE.Quaternion().setFromAxisAngle(
+                new THREE.Vector3(0, 1, 0),
+                Math.PI / 2
+              )
+            );
 
           const mat = new THREE.Matrix4();
           mat.compose(
             new THREE.Vector3(px, py, ez),
             q,
-            new THREE.Vector3(sideTileH, sideTileW, 1)
+            new THREE.Vector3(edgeTileH, edgeTileW, 1)
           );
           matrices.push(mat);
         }
@@ -262,14 +181,15 @@ function SentryLogoMesh() {
   const instanceRef = useRef<THREE.InstancedMesh>(null);
 
   const { matrices, solidGeo } = useMemo(() => {
-    const shapes = buildSentryShapes();
+    const shapes = parseSentryShapes();
 
+    // Build extruded base geometry
     const extrudeSettings: THREE.ExtrudeGeometryOptions = {
-      depth: DEPTH,
+      depth: DEPTH / SVG_SCALE,
       bevelEnabled: true,
-      bevelThickness: 0.025,
-      bevelSize: 0.025,
-      bevelSegments: 2,
+      bevelThickness: 0.3,
+      bevelSize: 0.3,
+      bevelSegments: 3,
     };
 
     const geos: THREE.ExtrudeGeometry[] = [];
@@ -279,15 +199,34 @@ function SentryLogoMesh() {
     const merged = mergeBufferGeometries(geos);
     geos.forEach((g) => g.dispose());
 
+    // Scale and center
+    merged.scale(SVG_SCALE, -SVG_SCALE, SVG_SCALE);
     merged.computeBoundingBox();
     const box = merged.boundingBox!;
-    merged.translate(
-      -(box.min.x + box.max.x) / 2,
-      -(box.min.y + box.max.y) / 2,
-      -(box.min.z + box.max.z) / 2
-    );
+    const cx = (box.min.x + box.max.x) / 2;
+    const cy = (box.min.y + box.max.y) / 2;
+    const cz = (box.min.z + box.max.z) / 2;
+    merged.translate(-cx, -cy, -cz);
+    merged.computeVertexNormals();
 
-    const mats = generateAllTiles(shapes);
+    // Compute center in scaled SVG space for tile generation
+    let sMinX = Infinity,
+      sMaxX = -Infinity,
+      sMinY = Infinity,
+      sMaxY = -Infinity;
+    for (const shape of shapes) {
+      const pts = shape.getPoints(120);
+      for (const p of pts) {
+        sMinX = Math.min(sMinX, p.x * SVG_SCALE);
+        sMaxX = Math.max(sMaxX, p.x * SVG_SCALE);
+        sMinY = Math.min(sMinY, p.y * SVG_SCALE);
+        sMaxY = Math.max(sMaxY, p.y * SVG_SCALE);
+      }
+    }
+    const centerX = (sMinX + sMaxX) / 2;
+    const centerY = (sMinY + sMaxY) / 2;
+
+    const mats = generateTileMatrices(shapes, centerX, centerY);
     return { matrices: mats, solidGeo: merged };
   }, []);
 
@@ -387,7 +326,6 @@ function mergeBufferGeometries(
   merged.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   merged.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
   merged.setIndex(new THREE.BufferAttribute(indices, 1));
-  merged.computeVertexNormals();
   return merged;
 }
 
@@ -398,10 +336,8 @@ export default function SentryDiscoBall() {
 
       <ambientLight intensity={0.5} />
 
-      {/* Key light - bright white from upper-right */}
       <directionalLight position={[5, 5, 8]} intensity={3} color="#ffffff" />
 
-      {/* Strong front spot for specular highlights */}
       <spotLight
         position={[3, 4, 8]}
         intensity={150}
@@ -411,7 +347,6 @@ export default function SentryDiscoBall() {
         castShadow
       />
 
-      {/* Fill from the left - soft purple */}
       <spotLight
         position={[-6, 2, 6]}
         intensity={80}
@@ -420,7 +355,6 @@ export default function SentryDiscoBall() {
         color="#d8b4fe"
       />
 
-      {/* Rim light from behind for edge definition */}
       <spotLight
         position={[0, 2, -6]}
         intensity={60}
@@ -429,7 +363,6 @@ export default function SentryDiscoBall() {
         color="#a78bfa"
       />
 
-      {/* Bottom fill */}
       <pointLight position={[0, -4, 4]} intensity={20} color="#c4b5fd" />
 
       <SentryLogoMesh />
