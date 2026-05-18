@@ -1,16 +1,159 @@
-import { useRef, useMemo, useEffect } from "react";
-import { useFrame } from "@react-three/fiber";
-import { Environment } from "@react-three/drei";
+import { useRef, useMemo } from "react";
+import { useFrame, extend } from "@react-three/fiber";
+import { Environment, shaderMaterial } from "@react-three/drei";
 import * as THREE from "three";
 import { SVGLoader } from "three/examples/jsm/loaders/SVGLoader.js";
 
 const DEPTH = 0.55;
-const TILE_SIZE = 0.09;
-const TILE_GAP = 0.01;
 const SVG_SCALE = 0.1;
 
 const SENTRY_SVG_PATH =
   "M29,2.26a4.67,4.67,0,0,0-8,0L14.42,13.53A32.21,32.21,0,0,1,32.17,40.19H27.55A27.68,27.68,0,0,0,12.09,17.47L6,28a15.92,15.92,0,0,1,9.23,12.17H4.62A.76.76,0,0,1,4,39.06l2.94-5a10.74,10.74,0,0,0-3.36-1.9l-2.91,5a4.54,4.54,0,0,0,1.69,6.24A4.66,4.66,0,0,0,4.62,44H19.15a19.4,19.4,0,0,0-8-17.31l2.31-4A23.87,23.87,0,0,1,23.76,44H36.07a35.88,35.88,0,0,0-16.41-31.8l4.67-8a.77.77,0,0,1,1.05-.27c.53.29,20.29,34.77,20.66,35.17a.76.76,0,0,1-.68,1.13H40.6q.09,1.91,0,3.81h4.78A4.59,4.59,0,0,0,50,39.43a4.49,4.49,0,0,0-.62-2.28Z";
+
+// Custom shader material that creates a disco-ball tile grid pattern
+// procedurally in world space. The entire surface is covered - tiles are
+// the reflective mirror areas, grooves are thin dark lines between them.
+const DiscoTileMaterial = shaderMaterial(
+  {
+    tileSize: 0.09,
+    grooveWidth: 0.008,
+    tileColor: new THREE.Color("#9b7ed0"),
+    grooveColor: new THREE.Color("#08050e"),
+    envMap: null as THREE.Texture | null,
+    envMapIntensity: 2.5,
+    lightDir1: new THREE.Vector3(0.4, 0.4, 0.8).normalize(),
+    lightDir2: new THREE.Vector3(-0.5, 0.3, 0.6).normalize(),
+    lightDir3: new THREE.Vector3(0.2, -0.3, 0.6).normalize(),
+    time: 0,
+  },
+  // Vertex shader
+  /* glsl */ `
+    varying vec3 vWorldPosition;
+    varying vec3 vWorldNormal;
+    varying vec3 vViewDir;
+
+    void main() {
+      vec4 worldPos = modelMatrix * vec4(position, 1.0);
+      vWorldPosition = worldPos.xyz;
+      vWorldNormal = normalize(mat3(modelMatrix) * normal);
+      vViewDir = normalize(cameraPosition - worldPos.xyz);
+      gl_Position = projectionMatrix * viewMatrix * worldPos;
+    }
+  `,
+  // Fragment shader
+  /* glsl */ `
+    uniform float tileSize;
+    uniform float grooveWidth;
+    uniform vec3 tileColor;
+    uniform vec3 grooveColor;
+    uniform float envMapIntensity;
+    uniform vec3 lightDir1;
+    uniform vec3 lightDir2;
+    uniform vec3 lightDir3;
+    uniform float time;
+
+    varying vec3 vWorldPosition;
+    varying vec3 vWorldNormal;
+    varying vec3 vViewDir;
+
+    // Tile grid in world space - works on every surface automatically
+    float tilePattern(vec3 pos, vec3 normal) {
+      // Project position onto the two axes perpendicular to the surface normal
+      // This makes the grid follow the surface orientation
+      vec3 absNormal = abs(normal);
+
+      vec2 uv;
+      if (absNormal.z >= absNormal.x && absNormal.z >= absNormal.y) {
+        uv = pos.xy;  // Front/back faces
+      } else if (absNormal.x >= absNormal.y) {
+        uv = pos.yz;  // Left/right side faces
+      } else {
+        uv = pos.xz;  // Top/bottom faces
+      }
+
+      // Create grid
+      vec2 cell = fract(uv / tileSize);
+      float halfGroove = grooveWidth / tileSize * 0.5;
+
+      // Groove at edges of each cell
+      float gx = smoothstep(0.0, halfGroove, cell.x) * smoothstep(0.0, halfGroove, 1.0 - cell.x);
+      float gy = smoothstep(0.0, halfGroove, cell.y) * smoothstep(0.0, halfGroove, 1.0 - cell.y);
+
+      return gx * gy;
+    }
+
+    void main() {
+      vec3 N = normalize(vWorldNormal);
+      vec3 V = normalize(vViewDir);
+
+      float tile = tilePattern(vWorldPosition, N);
+
+      // Per-tile slight normal perturbation for varied reflections
+      vec2 cellId;
+      {
+        vec3 absN = abs(N);
+        vec2 uv;
+        if (absN.z >= absN.x && absN.z >= absN.y) uv = vWorldPosition.xy;
+        else if (absN.x >= absN.y) uv = vWorldPosition.yz;
+        else uv = vWorldPosition.xz;
+        cellId = floor(uv / tileSize);
+      }
+      float hash1 = fract(sin(dot(cellId, vec2(127.1, 311.7))) * 43758.5453);
+      float hash2 = fract(sin(dot(cellId, vec2(269.5, 183.3))) * 43758.5453);
+      vec3 perturbedN = normalize(N + 0.04 * vec3(hash1 - 0.5, hash2 - 0.5, 0.0));
+
+      // Lighting
+      vec3 R = reflect(-V, perturbedN);
+
+      // Multiple specular highlights
+      float spec1 = pow(max(dot(R, lightDir1), 0.0), 80.0);
+      float spec2 = pow(max(dot(R, lightDir2), 0.0), 60.0);
+      float spec3 = pow(max(dot(R, lightDir3), 0.0), 40.0);
+
+      float diff1 = max(dot(N, lightDir1), 0.0);
+      float diff2 = max(dot(N, lightDir2), 0.0) * 0.6;
+      float diff3 = max(dot(N, lightDir3), 0.0) * 0.4;
+      float diffuse = diff1 + diff2 + diff3;
+
+      // Fresnel for edge reflections
+      float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+
+      // Environment reflection approximation
+      vec3 envColor = mix(
+        vec3(0.15, 0.1, 0.25),   // Dark purple ambient
+        vec3(0.7, 0.6, 0.9),     // Bright purple highlight
+        pow(max(R.y * 0.5 + 0.5, 0.0), 2.0)
+      ) * envMapIntensity;
+
+      // Sparkle effect - bright flashes as rotation changes reflection angle
+      float sparkle = pow(max(spec1, max(spec2, spec3)), 2.0);
+      vec3 sparkleColor = vec3(1.0, 0.95, 1.0) * sparkle * 3.0;
+
+      // Compose tile color
+      vec3 mirrorColor = tileColor * (0.3 + diffuse * 0.4)
+                       + envColor * (0.5 + fresnel * 0.5)
+                       + vec3(1.0) * (spec1 * 1.5 + spec2 * 0.8 + spec3 * 0.5)
+                       + sparkleColor;
+
+      // Mix between groove and tile
+      vec3 color = mix(grooveColor, mirrorColor, tile);
+
+      // Tone mapping
+      color = color / (color + vec3(1.0));
+
+      gl_FragColor = vec4(color, 1.0);
+    }
+  `
+);
+
+extend({ DiscoTileMaterial });
+
+declare module "@react-three/fiber" {
+  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+  interface ThreeElements {
+    discoTileMaterial: object;
+  }
+}
 
 function parseSentryShapes(): THREE.Shape[] {
   const loader = new SVGLoader();
@@ -23,200 +166,40 @@ function parseSentryShapes(): THREE.Shape[] {
   return shapes;
 }
 
-function isPointInShapes(
-  px: number,
-  py: number,
-  polygons: THREE.Vector2[][]
-): boolean {
-  for (const poly of polygons) {
-    let inside = false;
-    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-      const xi = poly[i].x, yi = poly[i].y;
-      const xj = poly[j].x, yj = poly[j].y;
-      if (
-        yi > py !== yj > py &&
-        px < ((xj - xi) * (py - yi)) / (yj - yi) + xi
-      ) {
-        inside = !inside;
-      }
-    }
-    if (inside) return true;
+function buildExtrudedGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
+  const extrudeSettings: THREE.ExtrudeGeometryOptions = {
+    depth: DEPTH / SVG_SCALE,
+    bevelEnabled: true,
+    bevelThickness: 0.25,
+    bevelSize: 0.25,
+    bevelSegments: 3,
+  };
+
+  const geos: THREE.ExtrudeGeometry[] = [];
+  for (const shape of shapes) {
+    geos.push(new THREE.ExtrudeGeometry(shape, extrudeSettings));
   }
-  return false;
-}
+  const merged = mergeBufferGeometries(geos);
+  geos.forEach((g) => g.dispose());
 
-function generateTileMatrices(
-  shapes: THREE.Shape[],
-  centerX: number,
-  centerY: number
-): THREE.Matrix4[] {
-  const matrices: THREE.Matrix4[] = [];
-  const step = TILE_SIZE + TILE_GAP;
-  const halfDepth = DEPTH / 2;
-
-  const polygons = shapes.map((s) => s.getPoints(150));
-  const scaledPolygons = polygons.map((poly) =>
-    poly.map((p) => new THREE.Vector2(p.x * SVG_SCALE, p.y * SVG_SCALE))
+  merged.scale(SVG_SCALE, -SVG_SCALE, SVG_SCALE);
+  merged.computeBoundingBox();
+  const box = merged.boundingBox!;
+  merged.translate(
+    -(box.min.x + box.max.x) / 2,
+    -(box.min.y + box.max.y) / 2,
+    -(box.min.z + box.max.z) / 2
   );
-
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const poly of scaledPolygons) {
-    for (const p of poly) {
-      minX = Math.min(minX, p.x);
-      maxX = Math.max(maxX, p.x);
-      minY = Math.min(minY, p.y);
-      maxY = Math.max(maxY, p.y);
-    }
-  }
-
-  // Front face
-  for (let x = minX; x <= maxX; x += step) {
-    for (let y = minY; y <= maxY; y += step) {
-      if (!isPointInShapes(x, y, scaledPolygons)) continue;
-      const mat = new THREE.Matrix4();
-      mat.compose(
-        new THREE.Vector3(x - centerX, -(y - centerY), halfDepth + 0.003),
-        new THREE.Quaternion(),
-        new THREE.Vector3(TILE_SIZE, TILE_SIZE, 1)
-      );
-      matrices.push(mat);
-    }
-  }
-
-  // Back face
-  const backQ = new THREE.Quaternion().setFromAxisAngle(
-    new THREE.Vector3(0, 1, 0),
-    Math.PI
-  );
-  for (let x = minX; x <= maxX; x += step) {
-    for (let y = minY; y <= maxY; y += step) {
-      if (!isPointInShapes(x, y, scaledPolygons)) continue;
-      const mat = new THREE.Matrix4();
-      mat.compose(
-        new THREE.Vector3(x - centerX, -(y - centerY), -halfDepth - 0.003),
-        backQ,
-        new THREE.Vector3(TILE_SIZE, TILE_SIZE, 1)
-      );
-      matrices.push(mat);
-    }
-  }
-
-  // Side faces - walk each polygon outline
-  for (const poly of scaledPolygons) {
-    let accumulated = 0;
-    for (let i = 0; i < poly.length; i++) {
-      const a = poly[i];
-      const b = poly[(i + 1) % poly.length];
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const edgeLen = Math.sqrt(dx * dx + dy * dy);
-      if (edgeLen < 0.0005) continue;
-
-      // 2D outward normal
-      const nx = -dy / edgeLen;
-      const ny = dx / edgeLen;
-
-      // Rotation: face normal is (nx, -ny, 0) in world space (Y is flipped)
-      // Build a quaternion that orients a Z-facing plane to face outward
-      const outward = new THREE.Vector3(nx, -ny, 0).normalize();
-      const quat = new THREE.Quaternion().setFromUnitVectors(
-        new THREE.Vector3(0, 0, 1),
-        outward
-      );
-
-      // Place tiles along this edge segment
-      const depthTiles = Math.max(1, Math.round(DEPTH / step));
-      const depthTileSize = (DEPTH / depthTiles) - TILE_GAP;
-
-      // Continue tiling along the perimeter with a running accumulator
-      let along = accumulated;
-      while (along < accumulated + edgeLen) {
-        const localT = along - accumulated;
-        const t = localT / edgeLen;
-        if (t > 1) break;
-
-        const wx = a.x + dx * t - centerX + nx * 0.003;
-        const wy = -(a.y + dy * t - centerY) - (-ny) * 0.003;
-
-        for (let di = 0; di < depthTiles; di++) {
-          const dz = -halfDepth + (di + 0.5) * (DEPTH / depthTiles);
-
-          const mat = new THREE.Matrix4();
-          mat.compose(
-            new THREE.Vector3(wx, wy, dz),
-            quat,
-            new THREE.Vector3(depthTileSize, TILE_SIZE, 1)
-          );
-          matrices.push(mat);
-        }
-
-        along += step;
-      }
-
-      accumulated += edgeLen;
-    }
-  }
-
-  return matrices;
+  merged.computeVertexNormals();
+  return merged;
 }
 
 function SentryLogoMesh() {
   const groupRef = useRef<THREE.Group>(null);
-  const instanceRef = useRef<THREE.InstancedMesh>(null);
-
-  const { matrices, solidGeo } = useMemo(() => {
+  const geometry = useMemo(() => {
     const shapes = parseSentryShapes();
-
-    const extrudeSettings: THREE.ExtrudeGeometryOptions = {
-      depth: DEPTH / SVG_SCALE,
-      bevelEnabled: true,
-      bevelThickness: 0.2,
-      bevelSize: 0.2,
-      bevelSegments: 2,
-    };
-
-    const geos: THREE.ExtrudeGeometry[] = [];
-    for (const shape of shapes) {
-      geos.push(new THREE.ExtrudeGeometry(shape, extrudeSettings));
-    }
-    const merged = mergeBufferGeometries(geos);
-    geos.forEach((g) => g.dispose());
-
-    merged.scale(SVG_SCALE, -SVG_SCALE, SVG_SCALE);
-    merged.computeBoundingBox();
-    const box = merged.boundingBox!;
-    merged.translate(
-      -(box.min.x + box.max.x) / 2,
-      -(box.min.y + box.max.y) / 2,
-      -(box.min.z + box.max.z) / 2
-    );
-    merged.computeVertexNormals();
-
-    // Center in scaled SVG space
-    let sMinX = Infinity, sMaxX = -Infinity, sMinY = Infinity, sMaxY = -Infinity;
-    for (const shape of shapes) {
-      for (const p of shape.getPoints(150)) {
-        sMinX = Math.min(sMinX, p.x * SVG_SCALE);
-        sMaxX = Math.max(sMaxX, p.x * SVG_SCALE);
-        sMinY = Math.min(sMinY, p.y * SVG_SCALE);
-        sMaxY = Math.max(sMaxY, p.y * SVG_SCALE);
-      }
-    }
-    const cx = (sMinX + sMaxX) / 2;
-    const cy = (sMinY + sMaxY) / 2;
-
-    const mats = generateTileMatrices(shapes, cx, cy);
-    return { matrices: mats, solidGeo: merged };
+    return buildExtrudedGeometry(shapes);
   }, []);
-
-  useEffect(() => {
-    const mesh = instanceRef.current;
-    if (!mesh) return;
-    for (let i = 0; i < matrices.length; i++) {
-      mesh.setMatrixAt(i, matrices[i]);
-    }
-    mesh.instanceMatrix.needsUpdate = true;
-  }, [matrices]);
 
   useFrame((_, delta) => {
     if (groupRef.current) {
@@ -224,34 +207,18 @@ function SentryLogoMesh() {
     }
   });
 
-  const tileGeo = useMemo(() => new THREE.PlaneGeometry(1, 1), []);
-
   return (
     <group ref={groupRef}>
-      <mesh geometry={solidGeo}>
-        <meshStandardMaterial
-          color="#120c1f"
-          metalness={0.4}
-          roughness={0.7}
+      <mesh geometry={geometry}>
+        <discoTileMaterial
           side={THREE.DoubleSide}
+          tileSize={0.09}
+          grooveWidth={0.006}
+          tileColor={new THREE.Color("#9b7ed0")}
+          grooveColor={new THREE.Color("#08050e")}
+          envMapIntensity={2.5}
         />
       </mesh>
-
-      <instancedMesh
-        ref={instanceRef}
-        args={[tileGeo, undefined, matrices.length]}
-      >
-        <meshPhysicalMaterial
-          color="#8b6cc1"
-          metalness={1.0}
-          roughness={0.02}
-          reflectivity={1}
-          clearcoat={1}
-          clearcoatRoughness={0.01}
-          envMapIntensity={3.0}
-          side={THREE.DoubleSide}
-        />
-      </instancedMesh>
     </group>
   );
 }
@@ -314,7 +281,6 @@ export default function SentryDiscoBall() {
       <color attach="background" args={["#08050e"]} />
 
       <ambientLight intensity={0.6} />
-
       <directionalLight position={[5, 5, 8]} intensity={4} color="#ffffff" />
 
       <spotLight
@@ -325,7 +291,6 @@ export default function SentryDiscoBall() {
         color="#ffffff"
         castShadow
       />
-
       <spotLight
         position={[-5, 3, 6]}
         intensity={100}
@@ -333,7 +298,6 @@ export default function SentryDiscoBall() {
         penumbra={0.6}
         color="#d8b4fe"
       />
-
       <spotLight
         position={[2, -3, 6]}
         intensity={60}
@@ -341,7 +305,6 @@ export default function SentryDiscoBall() {
         penumbra={0.7}
         color="#a78bfa"
       />
-
       <spotLight
         position={[0, 2, -6]}
         intensity={50}
@@ -349,7 +312,6 @@ export default function SentryDiscoBall() {
         penumbra={0.9}
         color="#7c3aed"
       />
-
       <pointLight position={[-3, -3, 5]} intensity={30} color="#c4b5fd" />
       <pointLight position={[3, 3, 5]} intensity={30} color="#ffffff" />
 
