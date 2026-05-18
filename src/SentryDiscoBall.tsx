@@ -1,6 +1,6 @@
 import { useRef, useMemo } from "react";
-import { useFrame, extend } from "@react-three/fiber";
-import { Environment, shaderMaterial } from "@react-three/drei";
+import { useFrame } from "@react-three/fiber";
+import { Environment } from "@react-three/drei";
 import * as THREE from "three";
 import { SVGLoader } from "three/examples/jsm/loaders/SVGLoader.js";
 
@@ -9,151 +9,6 @@ const SVG_SCALE = 0.1;
 
 const SENTRY_SVG_PATH =
   "M29,2.26a4.67,4.67,0,0,0-8,0L14.42,13.53A32.21,32.21,0,0,1,32.17,40.19H27.55A27.68,27.68,0,0,0,12.09,17.47L6,28a15.92,15.92,0,0,1,9.23,12.17H4.62A.76.76,0,0,1,4,39.06l2.94-5a10.74,10.74,0,0,0-3.36-1.9l-2.91,5a4.54,4.54,0,0,0,1.69,6.24A4.66,4.66,0,0,0,4.62,44H19.15a19.4,19.4,0,0,0-8-17.31l2.31-4A23.87,23.87,0,0,1,23.76,44H36.07a35.88,35.88,0,0,0-16.41-31.8l4.67-8a.77.77,0,0,1,1.05-.27c.53.29,20.29,34.77,20.66,35.17a.76.76,0,0,1-.68,1.13H40.6q.09,1.91,0,3.81h4.78A4.59,4.59,0,0,0,50,39.43a4.49,4.49,0,0,0-.62-2.28Z";
-
-// Custom shader material that creates a disco-ball tile grid pattern
-// procedurally in world space. The entire surface is covered - tiles are
-// the reflective mirror areas, grooves are thin dark lines between them.
-const DiscoTileMaterial = shaderMaterial(
-  {
-    tileSize: 0.09,
-    grooveWidth: 0.008,
-    tileColor: new THREE.Color("#9b7ed0"),
-    grooveColor: new THREE.Color("#08050e"),
-    envMap: null as THREE.Texture | null,
-    envMapIntensity: 2.5,
-    lightDir1: new THREE.Vector3(0.4, 0.4, 0.8).normalize(),
-    lightDir2: new THREE.Vector3(-0.5, 0.3, 0.6).normalize(),
-    lightDir3: new THREE.Vector3(0.2, -0.3, 0.6).normalize(),
-    time: 0,
-  },
-  // Vertex shader
-  /* glsl */ `
-    varying vec3 vWorldPosition;
-    varying vec3 vWorldNormal;
-    varying vec3 vViewDir;
-
-    void main() {
-      vec4 worldPos = modelMatrix * vec4(position, 1.0);
-      vWorldPosition = worldPos.xyz;
-      vWorldNormal = normalize(mat3(modelMatrix) * normal);
-      vViewDir = normalize(cameraPosition - worldPos.xyz);
-      gl_Position = projectionMatrix * viewMatrix * worldPos;
-    }
-  `,
-  // Fragment shader
-  /* glsl */ `
-    uniform float tileSize;
-    uniform float grooveWidth;
-    uniform vec3 tileColor;
-    uniform vec3 grooveColor;
-    uniform float envMapIntensity;
-    uniform vec3 lightDir1;
-    uniform vec3 lightDir2;
-    uniform vec3 lightDir3;
-    uniform float time;
-
-    varying vec3 vWorldPosition;
-    varying vec3 vWorldNormal;
-    varying vec3 vViewDir;
-
-    // Tile grid in world space - works on every surface automatically
-    float tilePattern(vec3 pos, vec3 normal) {
-      // Project position onto the two axes perpendicular to the surface normal
-      // This makes the grid follow the surface orientation
-      vec3 absNormal = abs(normal);
-
-      vec2 uv;
-      if (absNormal.z >= absNormal.x && absNormal.z >= absNormal.y) {
-        uv = pos.xy;  // Front/back faces
-      } else if (absNormal.x >= absNormal.y) {
-        uv = pos.yz;  // Left/right side faces
-      } else {
-        uv = pos.xz;  // Top/bottom faces
-      }
-
-      // Create grid
-      vec2 cell = fract(uv / tileSize);
-      float halfGroove = grooveWidth / tileSize * 0.5;
-
-      // Groove at edges of each cell
-      float gx = smoothstep(0.0, halfGroove, cell.x) * smoothstep(0.0, halfGroove, 1.0 - cell.x);
-      float gy = smoothstep(0.0, halfGroove, cell.y) * smoothstep(0.0, halfGroove, 1.0 - cell.y);
-
-      return gx * gy;
-    }
-
-    void main() {
-      vec3 N = normalize(vWorldNormal);
-      vec3 V = normalize(vViewDir);
-
-      float tile = tilePattern(vWorldPosition, N);
-
-      // Per-tile slight normal perturbation for varied reflections
-      vec2 cellId;
-      {
-        vec3 absN = abs(N);
-        vec2 uv;
-        if (absN.z >= absN.x && absN.z >= absN.y) uv = vWorldPosition.xy;
-        else if (absN.x >= absN.y) uv = vWorldPosition.yz;
-        else uv = vWorldPosition.xz;
-        cellId = floor(uv / tileSize);
-      }
-      float hash1 = fract(sin(dot(cellId, vec2(127.1, 311.7))) * 43758.5453);
-      float hash2 = fract(sin(dot(cellId, vec2(269.5, 183.3))) * 43758.5453);
-      vec3 perturbedN = normalize(N + 0.04 * vec3(hash1 - 0.5, hash2 - 0.5, 0.0));
-
-      // Lighting
-      vec3 R = reflect(-V, perturbedN);
-
-      // Multiple specular highlights
-      float spec1 = pow(max(dot(R, lightDir1), 0.0), 80.0);
-      float spec2 = pow(max(dot(R, lightDir2), 0.0), 60.0);
-      float spec3 = pow(max(dot(R, lightDir3), 0.0), 40.0);
-
-      float diff1 = max(dot(N, lightDir1), 0.0);
-      float diff2 = max(dot(N, lightDir2), 0.0) * 0.6;
-      float diff3 = max(dot(N, lightDir3), 0.0) * 0.4;
-      float diffuse = diff1 + diff2 + diff3;
-
-      // Fresnel for edge reflections
-      float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-
-      // Environment reflection approximation
-      vec3 envColor = mix(
-        vec3(0.15, 0.1, 0.25),   // Dark purple ambient
-        vec3(0.7, 0.6, 0.9),     // Bright purple highlight
-        pow(max(R.y * 0.5 + 0.5, 0.0), 2.0)
-      ) * envMapIntensity;
-
-      // Sparkle effect - bright flashes as rotation changes reflection angle
-      float sparkle = pow(max(spec1, max(spec2, spec3)), 2.0);
-      vec3 sparkleColor = vec3(1.0, 0.95, 1.0) * sparkle * 3.0;
-
-      // Compose tile color
-      vec3 mirrorColor = tileColor * (0.3 + diffuse * 0.4)
-                       + envColor * (0.5 + fresnel * 0.5)
-                       + vec3(1.0) * (spec1 * 1.5 + spec2 * 0.8 + spec3 * 0.5)
-                       + sparkleColor;
-
-      // Mix between groove and tile
-      vec3 color = mix(grooveColor, mirrorColor, tile);
-
-      // Tone mapping
-      color = color / (color + vec3(1.0));
-
-      gl_FragColor = vec4(color, 1.0);
-    }
-  `
-);
-
-extend({ DiscoTileMaterial });
-
-declare module "@react-three/fiber" {
-  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
-  interface ThreeElements {
-    discoTileMaterial: object;
-  }
-}
 
 function parseSentryShapes(): THREE.Shape[] {
   const loader = new SVGLoader();
@@ -194,12 +49,135 @@ function buildExtrudedGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
   return merged;
 }
 
+function createDiscoMaterial(): THREE.MeshPhysicalMaterial {
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: new THREE.Color("#9b7ed0"),
+    metalness: 1.0,
+    roughness: 0.03,
+    reflectivity: 1.0,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.02,
+    envMapIntensity: 2.5,
+    side: THREE.DoubleSide,
+  });
+
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.tileSize = { value: 0.09 };
+    shader.uniforms.grooveWidth = { value: 0.007 };
+
+    // Add varyings to vertex shader
+    shader.vertexShader = shader.vertexShader.replace(
+      "void main() {",
+      `
+      varying vec3 vWorldPos;
+      varying vec3 vWorldNorm;
+      void main() {
+      `
+    );
+    shader.vertexShader = shader.vertexShader.replace(
+      "#include <worldpos_vertex>",
+      `
+      #include <worldpos_vertex>
+      vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
+      vWorldNorm = normalize(mat3(modelMatrix) * normal);
+      `
+    );
+
+    // Inject tile pattern into fragment shader
+    shader.fragmentShader = shader.fragmentShader.replace(
+      "void main() {",
+      `
+      uniform float tileSize;
+      uniform float grooveWidth;
+      varying vec3 vWorldPos;
+      varying vec3 vWorldNorm;
+
+      float discoTilePattern(vec3 pos, vec3 norm) {
+        vec3 absN = abs(norm);
+        vec2 uv;
+        if (absN.z >= absN.x && absN.z >= absN.y) {
+          uv = pos.xy;
+        } else if (absN.x >= absN.y) {
+          uv = pos.yz;
+        } else {
+          uv = pos.xz;
+        }
+        vec2 cell = fract(uv / tileSize);
+        float hg = grooveWidth / tileSize * 0.5;
+        float gx = smoothstep(0.0, hg, cell.x) * smoothstep(0.0, hg, 1.0 - cell.x);
+        float gy = smoothstep(0.0, hg, cell.y) * smoothstep(0.0, hg, 1.0 - cell.y);
+        return gx * gy;
+      }
+
+      // Per-tile normal variation for disco ball shimmer
+      vec3 perturbNormal(vec3 norm, vec3 pos) {
+        vec3 absN = abs(norm);
+        vec2 uv;
+        if (absN.z >= absN.x && absN.z >= absN.y) uv = pos.xy;
+        else if (absN.x >= absN.y) uv = pos.yz;
+        else uv = pos.xz;
+        vec2 cellId = floor(uv / tileSize);
+        float h1 = fract(sin(dot(cellId, vec2(127.1, 311.7))) * 43758.5453);
+        float h2 = fract(sin(dot(cellId, vec2(269.5, 183.3))) * 43758.5453);
+        return normalize(norm + 0.06 * vec3(h1 - 0.5, h2 - 0.5, 0.0));
+      }
+
+      void main() {
+      `
+    );
+
+    // After normal mapping, perturb the normal per-tile for varied reflections
+    shader.fragmentShader = shader.fragmentShader.replace(
+      "#include <normal_fragment_maps>",
+      `
+      #include <normal_fragment_maps>
+      normal = perturbNormal(vWorldNorm, vWorldPos);
+      `
+    );
+
+    // Modify diffuse color and roughness based on tile pattern
+    shader.fragmentShader = shader.fragmentShader.replace(
+      "#include <color_fragment>",
+      `
+      #include <color_fragment>
+      float tileMask = discoTilePattern(vWorldPos, vWorldNorm);
+      // Grooves: dark and rough. Tiles: bright and mirror-like.
+      vec3 grooveCol = vec3(0.02, 0.015, 0.03);
+      diffuseColor.rgb = mix(grooveCol, diffuseColor.rgb, tileMask);
+      `
+    );
+
+    // Also vary roughness: grooves are matte, tiles are mirror
+    shader.fragmentShader = shader.fragmentShader.replace(
+      "#include <roughnessmap_fragment>",
+      `
+      #include <roughnessmap_fragment>
+      roughnessFactor = mix(0.9, roughnessFactor, tileMask);
+      `
+    );
+
+    // Vary metalness too
+    shader.fragmentShader = shader.fragmentShader.replace(
+      "#include <metalnessmap_fragment>",
+      `
+      #include <metalnessmap_fragment>
+      metalnessFactor = mix(0.1, metalnessFactor, tileMask);
+      `
+    );
+  };
+
+  return mat;
+}
+
 function SentryLogoMesh() {
   const groupRef = useRef<THREE.Group>(null);
+
   const geometry = useMemo(() => {
     const shapes = parseSentryShapes();
     return buildExtrudedGeometry(shapes);
   }, []);
+
+  const material = useMemo(() => createDiscoMaterial(), []);
 
   useFrame((_, delta) => {
     if (groupRef.current) {
@@ -209,16 +187,7 @@ function SentryLogoMesh() {
 
   return (
     <group ref={groupRef}>
-      <mesh geometry={geometry}>
-        <discoTileMaterial
-          side={THREE.DoubleSide}
-          tileSize={0.09}
-          grooveWidth={0.006}
-          tileColor={new THREE.Color("#9b7ed0")}
-          grooveColor={new THREE.Color("#08050e")}
-          envMapIntensity={2.5}
-        />
-      </mesh>
+      <mesh geometry={geometry} material={material} />
     </group>
   );
 }
