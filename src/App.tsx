@@ -13,12 +13,15 @@ function App() {
       >
         <SentryDiscoBall />
         <OrbitControls
-          enableZoom={false}
+          enableZoom={true}
           enablePan={false}
           autoRotate
           autoRotateSpeed={0.3}
           minPolarAngle={Math.PI / 3}
           maxPolarAngle={(2 * Math.PI) / 3}
+          minDistance={3}
+          maxDistance={15}
+          zoomSpeed={0.8}
         />
       </Canvas>
     </main>
