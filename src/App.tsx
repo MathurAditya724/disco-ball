@@ -20,10 +20,6 @@ function App() {
           maxPolarAngle={(2 * Math.PI) / 3}
         />
       </Canvas>
-      <div className="title">
-        <h1>SENTRY</h1>
-        <p>disco edition</p>
-      </div>
     </main>
   );
 }
