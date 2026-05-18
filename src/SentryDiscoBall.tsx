@@ -16,19 +16,12 @@ function parseSentryShapes(): THREE.Shape[] {
   const data = loader.parse(svgData);
   const shapes: THREE.Shape[] = [];
   for (const path of data.paths) {
-    const s = SVGLoader.createShapes(path);
-    shapes.push(...s);
+    shapes.push(...SVGLoader.createShapes(path));
   }
-  console.log("[SentryDiscoBall] Parsed shapes:", shapes.length);
   return shapes;
 }
 
 function buildGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
-  if (shapes.length === 0) {
-    console.warn("[SentryDiscoBall] No shapes parsed, using fallback box");
-    return new THREE.BoxGeometry(2, 2, 2);
-  }
-
   const extrudeSettings: THREE.ExtrudeGeometryOptions = {
     depth: DEPTH / SVG_SCALE,
     bevelEnabled: true,
@@ -42,21 +35,60 @@ function buildGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
     geos.push(new THREE.ExtrudeGeometry(shape, extrudeSettings));
   }
 
-  // Merge
+  // Merge geometries - handle both indexed and non-indexed
   let totalVerts = 0;
   let totalIdx = 0;
+  let hasIndices = true;
   for (const g of geos) {
     totalVerts += g.getAttribute("position").count;
-    totalIdx += g.index ? g.index.count : 0;
+    if (g.index) {
+      totalIdx += g.index.count;
+    } else {
+      hasIndices = false;
+    }
   }
+
   const positions = new Float32Array(totalVerts * 3);
   const normals = new Float32Array(totalVerts * 3);
-  const indices = new Uint32Array(totalIdx);
-  let vOff = 0, iOff = 0, vCount = 0;
+  let vOff = 0;
+
+  if (hasIndices) {
+    const indices = new Uint32Array(totalIdx);
+    let iOff = 0;
+    let vCount = 0;
+    for (const g of geos) {
+      const p = g.getAttribute("position");
+      const n = g.getAttribute("normal");
+      const idx = g.index!;
+      for (let i = 0; i < p.count; i++) {
+        positions[(vOff + i) * 3] = p.getX(i);
+        positions[(vOff + i) * 3 + 1] = p.getY(i);
+        positions[(vOff + i) * 3 + 2] = p.getZ(i);
+        if (n) {
+          normals[(vOff + i) * 3] = n.getX(i);
+          normals[(vOff + i) * 3 + 1] = n.getY(i);
+          normals[(vOff + i) * 3 + 2] = n.getZ(i);
+        }
+      }
+      for (let i = 0; i < idx.count; i++) {
+        indices[iOff + i] = idx.getX(i) + vCount;
+      }
+      iOff += idx.count;
+      vCount += p.count;
+      vOff += p.count;
+    }
+    const merged = new THREE.BufferGeometry();
+    merged.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    merged.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+    merged.setIndex(new THREE.BufferAttribute(indices, 1));
+    geos.forEach((g) => g.dispose());
+    return finalize(merged);
+  }
+
+  // Non-indexed: just concatenate position and normal arrays
   for (const g of geos) {
     const p = g.getAttribute("position");
     const n = g.getAttribute("normal");
-    const idx = g.index;
     for (let i = 0; i < p.count; i++) {
       positions[(vOff + i) * 3] = p.getX(i);
       positions[(vOff + i) * 3 + 1] = p.getY(i);
@@ -67,13 +99,6 @@ function buildGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
         normals[(vOff + i) * 3 + 2] = n.getZ(i);
       }
     }
-    if (idx) {
-      for (let i = 0; i < idx.count; i++) {
-        indices[iOff + i] = idx.getX(i) + vCount;
-      }
-      iOff += idx.count;
-    }
-    vCount += p.count;
     vOff += p.count;
   }
   geos.forEach((g) => g.dispose());
@@ -81,22 +106,23 @@ function buildGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
   const merged = new THREE.BufferGeometry();
   merged.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   merged.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
-  merged.setIndex(new THREE.BufferAttribute(indices, 1));
+  return finalize(merged);
+}
 
-  merged.scale(SVG_SCALE, -SVG_SCALE, SVG_SCALE);
-  merged.computeBoundingBox();
-  const box = merged.boundingBox!;
-  console.log("[SentryDiscoBall] Geometry bounds:", box.min.toArray(), box.max.toArray());
-  merged.translate(
+function finalize(geo: THREE.BufferGeometry): THREE.BufferGeometry {
+  geo.scale(SVG_SCALE, -SVG_SCALE, SVG_SCALE);
+  geo.computeBoundingBox();
+  const box = geo.boundingBox!;
+  geo.translate(
     -(box.min.x + box.max.x) / 2,
     -(box.min.y + box.max.y) / 2,
     -(box.min.z + box.max.z) / 2
   );
-  merged.computeVertexNormals();
+  geo.computeVertexNormals();
 
   // Triplanar UVs
-  const pos = merged.getAttribute("position");
-  const norm = merged.getAttribute("normal");
+  const pos = geo.getAttribute("position");
+  const norm = geo.getAttribute("normal");
   const uvs = new Float32Array(pos.count * 2);
   const uvScale = 1 / 0.09;
   for (let i = 0; i < pos.count; i++) {
@@ -114,10 +140,8 @@ function buildGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
       uvs[i * 2 + 1] = pos.getZ(i) * uvScale;
     }
   }
-  merged.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
-
-  console.log("[SentryDiscoBall] Vertices:", pos.count, "Indices:", totalIdx);
-  return merged;
+  geo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+  return geo;
 }
 
 function createTileTexture(): THREE.CanvasTexture {
