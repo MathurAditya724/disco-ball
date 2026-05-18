@@ -151,7 +151,7 @@ function createTileTexture(): THREE.CanvasTexture {
   canvas.height = size;
   const ctx = canvas.getContext("2d")!;
 
-  ctx.fillStyle = "#0a0714";
+  ctx.fillStyle = "#1D1127";
   ctx.fillRect(0, 0, size, size);
 
   const g = size * 0.04;
@@ -233,7 +233,7 @@ function SentryLogoMesh() {
         <meshPhysicalMaterial
           map={tileTex}
           roughnessMap={roughTex}
-          color="#9b7ed0"
+          color="#6C5FC7"
           metalness={1.0}
           roughness={0.05}
           reflectivity={1.0}
@@ -250,7 +250,7 @@ function SentryLogoMesh() {
 export default function SentryDiscoBall() {
   return (
     <>
-      <color attach="background" args={["#08050e"]} />
+      <color attach="background" args={["#1D1127"]} />
       <ambientLight intensity={1.0} />
       <directionalLight position={[5, 5, 8]} intensity={5} color="#ffffff" />
       <spotLight position={[4, 4, 8]} intensity={200} angle={0.5} penumbra={0.4} color="#ffffff" />
