@@ -4,7 +4,7 @@ import { Environment } from "@react-three/drei";
 import * as THREE from "three";
 import { SVGLoader } from "three/examples/jsm/loaders/SVGLoader.js";
 
-const DEPTH = 0.6;
+const DEPTH = 0.55;
 const TILE_SIZE = 0.09;
 const TILE_GAP = 0.01;
 const SVG_SCALE = 0.1;
@@ -23,225 +23,141 @@ function parseSentryShapes(): THREE.Shape[] {
   return shapes;
 }
 
-function buildExtrudedGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
-  const extrudeSettings: THREE.ExtrudeGeometryOptions = {
-    depth: DEPTH / SVG_SCALE,
-    bevelEnabled: true,
-    bevelThickness: 0.25,
-    bevelSize: 0.25,
-    bevelSegments: 2,
-  };
-
-  const geos: THREE.ExtrudeGeometry[] = [];
-  for (const shape of shapes) {
-    geos.push(new THREE.ExtrudeGeometry(shape, extrudeSettings));
-  }
-  const merged = mergeBufferGeometries(geos);
-  geos.forEach((g) => g.dispose());
-
-  merged.scale(SVG_SCALE, -SVG_SCALE, SVG_SCALE);
-  merged.computeBoundingBox();
-  const box = merged.boundingBox!;
-  merged.translate(
-    -(box.min.x + box.max.x) / 2,
-    -(box.min.y + box.max.y) / 2,
-    -(box.min.z + box.max.z) / 2
-  );
-  merged.computeVertexNormals();
-  return merged;
-}
-
-/**
- * Group triangles into coplanar face clusters, then tile each cluster
- * with a uniform grid. This avoids per-triangle tiling issues and
- * produces consistent tile coverage across the entire surface.
- */
-function generateTilesFromGeometry(
-  geometry: THREE.BufferGeometry
-): THREE.Matrix4[] {
-  const pos = geometry.getAttribute("position");
-  const idx = geometry.index;
-  if (!pos || !idx) return [];
-
-  const step = TILE_SIZE + TILE_GAP;
-
-  interface Face {
-    verts: [THREE.Vector3, THREE.Vector3, THREE.Vector3];
-    normal: THREE.Vector3;
-    center: THREE.Vector3;
-  }
-
-  const faces: Face[] = [];
-  const va = new THREE.Vector3();
-  const vb = new THREE.Vector3();
-  const vc = new THREE.Vector3();
-
-  for (let i = 0; i < idx.count; i += 3) {
-    va.fromBufferAttribute(pos, idx.getX(i));
-    vb.fromBufferAttribute(pos, idx.getX(i + 1));
-    vc.fromBufferAttribute(pos, idx.getX(i + 2));
-
-    // Use geometric face normal (cross product), not smooth vertex normals
-    const edge1 = new THREE.Vector3().subVectors(vb, va);
-    const edge2 = new THREE.Vector3().subVectors(vc, va);
-    const faceNorm = new THREE.Vector3().crossVectors(edge1, edge2);
-    const area = faceNorm.length();
-    if (area < 1e-8) continue;
-    faceNorm.normalize();
-
-    const center = new THREE.Vector3()
-      .addVectors(va, vb)
-      .add(vc)
-      .divideScalar(3);
-
-    faces.push({
-      verts: [va.clone(), vb.clone(), vc.clone()],
-      normal: faceNorm,
-      center: center,
-    });
-  }
-
-  // Group faces into coplanar clusters: same normal AND same plane offset
-  const clusters: Face[][] = [];
-  const assigned = new Array(faces.length).fill(false);
-  const normalThreshold = 0.985;
-  const planeDistThreshold = 0.015;
-
-  for (let i = 0; i < faces.length; i++) {
-    if (assigned[i]) continue;
-    const cluster: Face[] = [faces[i]];
-    assigned[i] = true;
-    const refNormal = faces[i].normal;
-    const refPlaneDist = faces[i].center.dot(refNormal);
-
-    for (let j = i + 1; j < faces.length; j++) {
-      if (assigned[j]) continue;
-      if (refNormal.dot(faces[j].normal) < normalThreshold) continue;
-      const planeDist = Math.abs(faces[j].center.dot(refNormal) - refPlaneDist);
-      if (planeDist > planeDistThreshold) continue;
-      cluster.push(faces[j]);
-      assigned[j] = true;
-    }
-    clusters.push(cluster);
-  }
-
-  // For each cluster, build a local 2D coordinate frame and tile it
-  const allMatrices: THREE.Matrix4[] = [];
-  const globalPlaced = new Set<string>();
-
-  for (const cluster of clusters) {
-    if (cluster.length === 0) continue;
-
-    // Average normal for the cluster
-    const avgNormal = new THREE.Vector3();
-    for (const f of cluster) avgNormal.add(f.normal);
-    avgNormal.normalize();
-
-    // Build tangent frame
-    const up =
-      Math.abs(avgNormal.y) > 0.99
-        ? new THREE.Vector3(1, 0, 0)
-        : new THREE.Vector3(0, 1, 0);
-    const tangent = new THREE.Vector3().crossVectors(up, avgNormal).normalize();
-    const bitangent = new THREE.Vector3()
-      .crossVectors(avgNormal, tangent)
-      .normalize();
-
-    // Project all triangle vertices into 2D and collect triangles
-    const tris2d: { a: THREE.Vector2; b: THREE.Vector2; c: THREE.Vector2 }[] = [];
-    let minU = Infinity,
-      maxU = -Infinity,
-      minV = Infinity,
-      maxV = -Infinity;
-
-    const refPoint = cluster[0].center;
-    for (const face of cluster) {
-      const pts2d: THREE.Vector2[] = [];
-      for (const v of face.verts) {
-        const rel = new THREE.Vector3().subVectors(v, refPoint);
-        const u = rel.dot(tangent);
-        const vv = rel.dot(bitangent);
-        pts2d.push(new THREE.Vector2(u, vv));
-        minU = Math.min(minU, u);
-        maxU = Math.max(maxU, u);
-        minV = Math.min(minV, vv);
-        maxV = Math.max(maxV, vv);
-      }
-      tris2d.push({ a: pts2d[0], b: pts2d[1], c: pts2d[2] });
-    }
-
-    // Snap grid to global alignment
-    const startU = Math.floor(minU / step) * step;
-    const startV = Math.floor(minV / step) * step;
-
-    // Build rotation quaternion for tiles on this cluster
-    const lookTarget = new THREE.Vector3().addVectors(refPoint, avgNormal);
-    const lookMat = new THREE.Matrix4().lookAt(
-      refPoint,
-      lookTarget,
-      Math.abs(avgNormal.y) > 0.99
-        ? new THREE.Vector3(0, 0, 1)
-        : new THREE.Vector3(0, 1, 0)
-    );
-    const quat = new THREE.Quaternion().setFromRotationMatrix(lookMat);
-
-    for (let u = startU; u <= maxU; u += step) {
-      for (let v = startV; v <= maxV; v += step) {
-        const pt2d = new THREE.Vector2(u, v);
-        let insideAny = false;
-        for (const tri of tris2d) {
-          if (pointInTriangle2D(pt2d, tri.a, tri.b, tri.c)) {
-            insideAny = true;
-            break;
-          }
-        }
-        if (!insideAny) continue;
-
-        // Convert back to 3D
-        const worldPos = new THREE.Vector3()
-          .copy(refPoint)
-          .addScaledVector(tangent, u)
-          .addScaledVector(bitangent, v)
-          .addScaledVector(avgNormal, 0.003);
-
-        // Deduplicate (tiles at cluster boundaries)
-        const kx = Math.round(worldPos.x * 500);
-        const ky = Math.round(worldPos.y * 500);
-        const kz = Math.round(worldPos.z * 500);
-        const key = `${kx},${ky},${kz}`;
-        if (globalPlaced.has(key)) continue;
-        globalPlaced.add(key);
-
-        const mat = new THREE.Matrix4();
-        mat.compose(
-          worldPos,
-          quat,
-          new THREE.Vector3(TILE_SIZE, TILE_SIZE, 1)
-        );
-        allMatrices.push(mat);
-      }
-    }
-  }
-
-  return allMatrices;
-}
-
-function pointInTriangle2D(
-  p: THREE.Vector2,
-  a: THREE.Vector2,
-  b: THREE.Vector2,
-  c: THREE.Vector2
+function isPointInShapes(
+  px: number,
+  py: number,
+  polygons: THREE.Vector2[][]
 ): boolean {
-  const d1 = sign(p, a, b);
-  const d2 = sign(p, b, c);
-  const d3 = sign(p, c, a);
-  const hasNeg = d1 < 0 || d2 < 0 || d3 < 0;
-  const hasPos = d1 > 0 || d2 > 0 || d3 > 0;
-  return !(hasNeg && hasPos);
+  for (const poly of polygons) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i].x, yi = poly[i].y;
+      const xj = poly[j].x, yj = poly[j].y;
+      if (
+        yi > py !== yj > py &&
+        px < ((xj - xi) * (py - yi)) / (yj - yi) + xi
+      ) {
+        inside = !inside;
+      }
+    }
+    if (inside) return true;
+  }
+  return false;
 }
 
-function sign(p1: THREE.Vector2, p2: THREE.Vector2, p3: THREE.Vector2): number {
-  return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+function generateTileMatrices(
+  shapes: THREE.Shape[],
+  centerX: number,
+  centerY: number
+): THREE.Matrix4[] {
+  const matrices: THREE.Matrix4[] = [];
+  const step = TILE_SIZE + TILE_GAP;
+  const halfDepth = DEPTH / 2;
+
+  const polygons = shapes.map((s) => s.getPoints(150));
+  const scaledPolygons = polygons.map((poly) =>
+    poly.map((p) => new THREE.Vector2(p.x * SVG_SCALE, p.y * SVG_SCALE))
+  );
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const poly of scaledPolygons) {
+    for (const p of poly) {
+      minX = Math.min(minX, p.x);
+      maxX = Math.max(maxX, p.x);
+      minY = Math.min(minY, p.y);
+      maxY = Math.max(maxY, p.y);
+    }
+  }
+
+  // Front face
+  for (let x = minX; x <= maxX; x += step) {
+    for (let y = minY; y <= maxY; y += step) {
+      if (!isPointInShapes(x, y, scaledPolygons)) continue;
+      const mat = new THREE.Matrix4();
+      mat.compose(
+        new THREE.Vector3(x - centerX, -(y - centerY), halfDepth + 0.003),
+        new THREE.Quaternion(),
+        new THREE.Vector3(TILE_SIZE, TILE_SIZE, 1)
+      );
+      matrices.push(mat);
+    }
+  }
+
+  // Back face
+  const backQ = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(0, 1, 0),
+    Math.PI
+  );
+  for (let x = minX; x <= maxX; x += step) {
+    for (let y = minY; y <= maxY; y += step) {
+      if (!isPointInShapes(x, y, scaledPolygons)) continue;
+      const mat = new THREE.Matrix4();
+      mat.compose(
+        new THREE.Vector3(x - centerX, -(y - centerY), -halfDepth - 0.003),
+        backQ,
+        new THREE.Vector3(TILE_SIZE, TILE_SIZE, 1)
+      );
+      matrices.push(mat);
+    }
+  }
+
+  // Side faces - walk each polygon outline
+  for (const poly of scaledPolygons) {
+    let accumulated = 0;
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i];
+      const b = poly[(i + 1) % poly.length];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const edgeLen = Math.sqrt(dx * dx + dy * dy);
+      if (edgeLen < 0.0005) continue;
+
+      // 2D outward normal
+      const nx = -dy / edgeLen;
+      const ny = dx / edgeLen;
+
+      // Rotation: face normal is (nx, -ny, 0) in world space (Y is flipped)
+      // Build a quaternion that orients a Z-facing plane to face outward
+      const outward = new THREE.Vector3(nx, -ny, 0).normalize();
+      const quat = new THREE.Quaternion().setFromUnitVectors(
+        new THREE.Vector3(0, 0, 1),
+        outward
+      );
+
+      // Place tiles along this edge segment
+      const depthTiles = Math.max(1, Math.round(DEPTH / step));
+      const depthTileSize = (DEPTH / depthTiles) - TILE_GAP;
+
+      // Continue tiling along the perimeter with a running accumulator
+      let along = accumulated;
+      while (along < accumulated + edgeLen) {
+        const localT = along - accumulated;
+        const t = localT / edgeLen;
+        if (t > 1) break;
+
+        const wx = a.x + dx * t - centerX + nx * 0.003;
+        const wy = -(a.y + dy * t - centerY) - (-ny) * 0.003;
+
+        for (let di = 0; di < depthTiles; di++) {
+          const dz = -halfDepth + (di + 0.5) * (DEPTH / depthTiles);
+
+          const mat = new THREE.Matrix4();
+          mat.compose(
+            new THREE.Vector3(wx, wy, dz),
+            quat,
+            new THREE.Vector3(depthTileSize, TILE_SIZE, 1)
+          );
+          matrices.push(mat);
+        }
+
+        along += step;
+      }
+
+      accumulated += edgeLen;
+    }
+  }
+
+  return matrices;
 }
 
 function SentryLogoMesh() {
@@ -250,9 +166,47 @@ function SentryLogoMesh() {
 
   const { matrices, solidGeo } = useMemo(() => {
     const shapes = parseSentryShapes();
-    const geo = buildExtrudedGeometry(shapes);
-    const mats = generateTilesFromGeometry(geo);
-    return { matrices: mats, solidGeo: geo };
+
+    const extrudeSettings: THREE.ExtrudeGeometryOptions = {
+      depth: DEPTH / SVG_SCALE,
+      bevelEnabled: true,
+      bevelThickness: 0.2,
+      bevelSize: 0.2,
+      bevelSegments: 2,
+    };
+
+    const geos: THREE.ExtrudeGeometry[] = [];
+    for (const shape of shapes) {
+      geos.push(new THREE.ExtrudeGeometry(shape, extrudeSettings));
+    }
+    const merged = mergeBufferGeometries(geos);
+    geos.forEach((g) => g.dispose());
+
+    merged.scale(SVG_SCALE, -SVG_SCALE, SVG_SCALE);
+    merged.computeBoundingBox();
+    const box = merged.boundingBox!;
+    merged.translate(
+      -(box.min.x + box.max.x) / 2,
+      -(box.min.y + box.max.y) / 2,
+      -(box.min.z + box.max.z) / 2
+    );
+    merged.computeVertexNormals();
+
+    // Center in scaled SVG space
+    let sMinX = Infinity, sMaxX = -Infinity, sMinY = Infinity, sMaxY = -Infinity;
+    for (const shape of shapes) {
+      for (const p of shape.getPoints(150)) {
+        sMinX = Math.min(sMinX, p.x * SVG_SCALE);
+        sMaxX = Math.max(sMaxX, p.x * SVG_SCALE);
+        sMinY = Math.min(sMinY, p.y * SVG_SCALE);
+        sMaxY = Math.max(sMaxY, p.y * SVG_SCALE);
+      }
+    }
+    const cx = (sMinX + sMaxX) / 2;
+    const cy = (sMinY + sMaxY) / 2;
+
+    const mats = generateTileMatrices(shapes, cx, cy);
+    return { matrices: mats, solidGeo: merged };
   }, []);
 
   useEffect(() => {
@@ -276,9 +230,9 @@ function SentryLogoMesh() {
     <group ref={groupRef}>
       <mesh geometry={solidGeo}>
         <meshStandardMaterial
-          color="#0e0a18"
-          metalness={0.5}
-          roughness={0.6}
+          color="#120c1f"
+          metalness={0.4}
+          roughness={0.7}
           side={THREE.DoubleSide}
         />
       </mesh>
@@ -359,36 +313,45 @@ export default function SentryDiscoBall() {
     <>
       <color attach="background" args={["#08050e"]} />
 
-      <ambientLight intensity={0.5} />
+      <ambientLight intensity={0.6} />
 
-      <directionalLight position={[5, 5, 8]} intensity={3} color="#ffffff" />
+      <directionalLight position={[5, 5, 8]} intensity={4} color="#ffffff" />
 
       <spotLight
-        position={[3, 4, 8]}
-        intensity={150}
-        angle={0.4}
+        position={[4, 4, 8]}
+        intensity={180}
+        angle={0.5}
         penumbra={0.4}
         color="#ffffff"
         castShadow
       />
 
       <spotLight
-        position={[-6, 2, 6]}
-        intensity={80}
+        position={[-5, 3, 6]}
+        intensity={100}
         angle={0.6}
-        penumbra={0.7}
+        penumbra={0.6}
         color="#d8b4fe"
       />
 
       <spotLight
-        position={[0, 2, -6]}
+        position={[2, -3, 6]}
         intensity={60}
-        angle={0.8}
-        penumbra={0.9}
+        angle={0.7}
+        penumbra={0.7}
         color="#a78bfa"
       />
 
-      <pointLight position={[0, -4, 4]} intensity={20} color="#c4b5fd" />
+      <spotLight
+        position={[0, 2, -6]}
+        intensity={50}
+        angle={0.8}
+        penumbra={0.9}
+        color="#7c3aed"
+      />
+
+      <pointLight position={[-3, -3, 5]} intensity={30} color="#c4b5fd" />
+      <pointLight position={[3, 3, 5]} intensity={30} color="#ffffff" />
 
       <SentryLogoMesh />
 
