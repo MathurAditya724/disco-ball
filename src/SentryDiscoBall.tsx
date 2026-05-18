@@ -16,12 +16,19 @@ function parseSentryShapes(): THREE.Shape[] {
   const data = loader.parse(svgData);
   const shapes: THREE.Shape[] = [];
   for (const path of data.paths) {
-    shapes.push(...SVGLoader.createShapes(path));
+    const s = SVGLoader.createShapes(path);
+    shapes.push(...s);
   }
+  console.log("[SentryDiscoBall] Parsed shapes:", shapes.length);
   return shapes;
 }
 
 function buildGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
+  if (shapes.length === 0) {
+    console.warn("[SentryDiscoBall] No shapes parsed, using fallback box");
+    return new THREE.BoxGeometry(2, 2, 2);
+  }
+
   const extrudeSettings: THREE.ExtrudeGeometryOptions = {
     depth: DEPTH / SVG_SCALE,
     bevelEnabled: true,
@@ -34,168 +41,161 @@ function buildGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
   for (const shape of shapes) {
     geos.push(new THREE.ExtrudeGeometry(shape, extrudeSettings));
   }
-  const merged = mergeGeometries(geos);
+
+  // Merge
+  let totalVerts = 0;
+  let totalIdx = 0;
+  for (const g of geos) {
+    totalVerts += g.getAttribute("position").count;
+    totalIdx += g.index ? g.index.count : 0;
+  }
+  const positions = new Float32Array(totalVerts * 3);
+  const normals = new Float32Array(totalVerts * 3);
+  const indices = new Uint32Array(totalIdx);
+  let vOff = 0, iOff = 0, vCount = 0;
+  for (const g of geos) {
+    const p = g.getAttribute("position");
+    const n = g.getAttribute("normal");
+    const idx = g.index;
+    for (let i = 0; i < p.count; i++) {
+      positions[(vOff + i) * 3] = p.getX(i);
+      positions[(vOff + i) * 3 + 1] = p.getY(i);
+      positions[(vOff + i) * 3 + 2] = p.getZ(i);
+      if (n) {
+        normals[(vOff + i) * 3] = n.getX(i);
+        normals[(vOff + i) * 3 + 1] = n.getY(i);
+        normals[(vOff + i) * 3 + 2] = n.getZ(i);
+      }
+    }
+    if (idx) {
+      for (let i = 0; i < idx.count; i++) {
+        indices[iOff + i] = idx.getX(i) + vCount;
+      }
+      iOff += idx.count;
+    }
+    vCount += p.count;
+    vOff += p.count;
+  }
   geos.forEach((g) => g.dispose());
+
+  const merged = new THREE.BufferGeometry();
+  merged.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  merged.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+  merged.setIndex(new THREE.BufferAttribute(indices, 1));
 
   merged.scale(SVG_SCALE, -SVG_SCALE, SVG_SCALE);
   merged.computeBoundingBox();
   const box = merged.boundingBox!;
+  console.log("[SentryDiscoBall] Geometry bounds:", box.min.toArray(), box.max.toArray());
   merged.translate(
     -(box.min.x + box.max.x) / 2,
     -(box.min.y + box.max.y) / 2,
     -(box.min.z + box.max.z) / 2
   );
   merged.computeVertexNormals();
+
+  // Triplanar UVs
+  const pos = merged.getAttribute("position");
+  const norm = merged.getAttribute("normal");
+  const uvs = new Float32Array(pos.count * 2);
+  const uvScale = 1 / 0.09;
+  for (let i = 0; i < pos.count; i++) {
+    const nx = Math.abs(norm.getX(i));
+    const ny = Math.abs(norm.getY(i));
+    const nz = Math.abs(norm.getZ(i));
+    if (nz >= nx && nz >= ny) {
+      uvs[i * 2] = pos.getX(i) * uvScale;
+      uvs[i * 2 + 1] = pos.getY(i) * uvScale;
+    } else if (nx >= ny) {
+      uvs[i * 2] = pos.getY(i) * uvScale;
+      uvs[i * 2 + 1] = pos.getZ(i) * uvScale;
+    } else {
+      uvs[i * 2] = pos.getX(i) * uvScale;
+      uvs[i * 2 + 1] = pos.getZ(i) * uvScale;
+    }
+  }
+  merged.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+
+  console.log("[SentryDiscoBall] Vertices:", pos.count, "Indices:", totalIdx);
   return merged;
 }
 
-/**
- * Generate a grid-pattern texture that creates the disco tile look.
- * Each cell is bright (white) with thin dark borders (grooves).
- */
-function createTileTexture(
-  resolution: number,
-  gridCells: number,
-  grooveFraction: number
-): THREE.CanvasTexture {
+function createTileTexture(): THREE.CanvasTexture {
+  const size = 256;
   const canvas = document.createElement("canvas");
-  canvas.width = resolution;
-  canvas.height = resolution;
+  canvas.width = size;
+  canvas.height = size;
   const ctx = canvas.getContext("2d")!;
 
-  const cellSize = resolution / gridCells;
-  const grooveSize = cellSize * grooveFraction;
-
-  // Fill background with groove color
   ctx.fillStyle = "#0a0714";
-  ctx.fillRect(0, 0, resolution, resolution);
+  ctx.fillRect(0, 0, size, size);
 
-  // Draw bright tile cells
+  const g = size * 0.04;
+  const w = size - g * 2;
+  const r = 8;
   ctx.fillStyle = "#ffffff";
-  for (let gx = 0; gx < gridCells; gx++) {
-    for (let gy = 0; gy < gridCells; gy++) {
-      const x = gx * cellSize + grooveSize / 2;
-      const y = gy * cellSize + grooveSize / 2;
-      const s = cellSize - grooveSize;
-
-      // Slightly rounded corners for a nicer look
-      const r = Math.min(s * 0.08, 3);
-      ctx.beginPath();
-      ctx.moveTo(x + r, y);
-      ctx.lineTo(x + s - r, y);
-      ctx.quadraticCurveTo(x + s, y, x + s, y + r);
-      ctx.lineTo(x + s, y + s - r);
-      ctx.quadraticCurveTo(x + s, y + s, x + s - r, y + s);
-      ctx.lineTo(x + r, y + s);
-      ctx.quadraticCurveTo(x, y + s, x, y + s - r);
-      ctx.lineTo(x, y + r);
-      ctx.quadraticCurveTo(x, y, x + r, y);
-      ctx.closePath();
-      ctx.fill();
-    }
-  }
+  ctx.beginPath();
+  ctx.moveTo(g + r, g);
+  ctx.lineTo(g + w - r, g);
+  ctx.quadraticCurveTo(g + w, g, g + w, g + r);
+  ctx.lineTo(g + w, g + w - r);
+  ctx.quadraticCurveTo(g + w, g + w, g + w - r, g + w);
+  ctx.lineTo(g + r, g + w);
+  ctx.quadraticCurveTo(g, g + w, g, g + w - r);
+  ctx.lineTo(g, g + r);
+  ctx.quadraticCurveTo(g, g, g + r, g);
+  ctx.closePath();
+  ctx.fill();
 
   const tex = new THREE.CanvasTexture(canvas);
   tex.wrapS = THREE.RepeatWrapping;
   tex.wrapT = THREE.RepeatWrapping;
-  tex.magFilter = THREE.LinearFilter;
-  tex.minFilter = THREE.LinearMipmapLinearFilter;
   return tex;
 }
 
-/**
- * Build a custom UV attribute based on triplanar projection:
- * for each vertex, pick the two world-space axes most perpendicular
- * to the vertex normal, and use them as UV coordinates.
- */
-function applyTriplanarUVs(
-  geometry: THREE.BufferGeometry,
-  tilesPerUnit: number
-) {
-  const pos = geometry.getAttribute("position");
-  const norm = geometry.getAttribute("normal");
-  const count = pos.count;
-  const uvs = new Float32Array(count * 2);
+function createRoughnessTexture(): THREE.CanvasTexture {
+  const size = 256;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
 
-  for (let i = 0; i < count; i++) {
-    const nx = Math.abs(norm.getX(i));
-    const ny = Math.abs(norm.getY(i));
-    const nz = Math.abs(norm.getZ(i));
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, size, size);
 
-    let u: number, v: number;
-    if (nz >= nx && nz >= ny) {
-      // Front/back: use XY
-      u = pos.getX(i);
-      v = pos.getY(i);
-    } else if (nx >= ny) {
-      // Left/right: use YZ
-      u = pos.getY(i);
-      v = pos.getZ(i);
-    } else {
-      // Top/bottom: use XZ
-      u = pos.getX(i);
-      v = pos.getZ(i);
-    }
+  const g = size * 0.04;
+  const w = size - g * 2;
+  const r = 8;
+  ctx.fillStyle = "#0a0a0a";
+  ctx.beginPath();
+  ctx.moveTo(g + r, g);
+  ctx.lineTo(g + w - r, g);
+  ctx.quadraticCurveTo(g + w, g, g + w, g + r);
+  ctx.lineTo(g + w, g + w - r);
+  ctx.quadraticCurveTo(g + w, g + w, g + w - r, g + w);
+  ctx.lineTo(g + r, g + w);
+  ctx.quadraticCurveTo(g, g + w, g, g + w - r);
+  ctx.lineTo(g, g + r);
+  ctx.quadraticCurveTo(g, g, g + r, g);
+  ctx.closePath();
+  ctx.fill();
 
-    uvs[i * 2] = u * tilesPerUnit;
-    uvs[i * 2 + 1] = v * tilesPerUnit;
-  }
-
-  geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  return tex;
 }
 
 function SentryLogoMesh() {
   const groupRef = useRef<THREE.Group>(null);
 
-  const { geometry, tileTexture, roughnessTexture } = useMemo(() => {
+  const geometry = useMemo(() => {
     const shapes = parseSentryShapes();
-    const geo = buildGeometry(shapes);
-
-    // Tile scale: how many tiles per world unit
-    const tilesPerUnit = 1 / 0.09;
-    applyTriplanarUVs(geo, tilesPerUnit);
-
-    // Color/alpha texture for the tile pattern
-    const tileTex = createTileTexture(1024, 1, 0.06);
-    tileTex.repeat.set(1, 1);
-
-    // Roughness map: tiles are smooth (dark=low roughness), grooves are rough (bright=high roughness)
-    const roughCanvas = document.createElement("canvas");
-    roughCanvas.width = 256;
-    roughCanvas.height = 256;
-    const rctx = roughCanvas.getContext("2d")!;
-    const cellSize = 256;
-    const grooveSize = cellSize * 0.06;
-
-    // Grooves are rough (white = high roughness)
-    rctx.fillStyle = "#ffffff";
-    rctx.fillRect(0, 0, 256, 256);
-
-    // Tiles are smooth (black = low roughness)
-    rctx.fillStyle = "#0a0a0a";
-    const x = grooveSize / 2;
-    const y = grooveSize / 2;
-    const s = cellSize - grooveSize;
-    const r = Math.min(s * 0.08, 6);
-    rctx.beginPath();
-    rctx.moveTo(x + r, y);
-    rctx.lineTo(x + s - r, y);
-    rctx.quadraticCurveTo(x + s, y, x + s, y + r);
-    rctx.lineTo(x + s, y + s - r);
-    rctx.quadraticCurveTo(x + s, y + s, x + s - r, y + s);
-    rctx.lineTo(x + r, y + s);
-    rctx.quadraticCurveTo(x, y + s, x, y + s - r);
-    rctx.lineTo(x, y + r);
-    rctx.quadraticCurveTo(x, y, x + r, y);
-    rctx.closePath();
-    rctx.fill();
-
-    const roughTex = new THREE.CanvasTexture(roughCanvas);
-    roughTex.wrapS = THREE.RepeatWrapping;
-    roughTex.wrapT = THREE.RepeatWrapping;
-
-    return { geometry: geo, tileTexture: tileTex, roughnessTexture: roughTex };
+    return buildGeometry(shapes);
   }, []);
+
+  const tileTex = useMemo(() => createTileTexture(), []);
+  const roughTex = useMemo(() => createRoughnessTexture(), []);
 
   useFrame((_, delta) => {
     if (groupRef.current) {
@@ -207,15 +207,15 @@ function SentryLogoMesh() {
     <group ref={groupRef}>
       <mesh geometry={geometry}>
         <meshPhysicalMaterial
+          map={tileTex}
+          roughnessMap={roughTex}
           color="#9b7ed0"
-          map={tileTexture}
-          roughnessMap={roughnessTexture}
           metalness={1.0}
-          roughness={0.03}
+          roughness={0.05}
           reflectivity={1.0}
           clearcoat={1.0}
-          clearcoatRoughness={0.02}
-          envMapIntensity={2.5}
+          clearcoatRoughness={0.03}
+          envMapIntensity={2.0}
           side={THREE.DoubleSide}
         />
       </mesh>
@@ -223,100 +223,18 @@ function SentryLogoMesh() {
   );
 }
 
-function mergeGeometries(
-  geometries: THREE.BufferGeometry[]
-): THREE.BufferGeometry {
-  let totalVerts = 0;
-  let totalIndices = 0;
-  for (const g of geometries) {
-    totalVerts += g.getAttribute("position").count;
-    totalIndices += g.index ? g.index.count : 0;
-  }
-
-  const positions = new Float32Array(totalVerts * 3);
-  const normals = new Float32Array(totalVerts * 3);
-  const indices = new Uint32Array(totalIndices);
-
-  let vertexOffset = 0;
-  let indexOffset = 0;
-  let vertCount = 0;
-
-  for (const g of geometries) {
-    const p = g.getAttribute("position");
-    const n = g.getAttribute("normal");
-    const gIdx = g.index;
-
-    for (let i = 0; i < p.count; i++) {
-      positions[(vertexOffset + i) * 3] = p.getX(i);
-      positions[(vertexOffset + i) * 3 + 1] = p.getY(i);
-      positions[(vertexOffset + i) * 3 + 2] = p.getZ(i);
-      if (n) {
-        normals[(vertexOffset + i) * 3] = n.getX(i);
-        normals[(vertexOffset + i) * 3 + 1] = n.getY(i);
-        normals[(vertexOffset + i) * 3 + 2] = n.getZ(i);
-      }
-    }
-
-    if (gIdx) {
-      for (let i = 0; i < gIdx.count; i++) {
-        indices[indexOffset + i] = gIdx.getX(i) + vertCount;
-      }
-      indexOffset += gIdx.count;
-    }
-
-    vertCount += p.count;
-    vertexOffset += p.count;
-  }
-
-  const merged = new THREE.BufferGeometry();
-  merged.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  merged.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
-  merged.setIndex(new THREE.BufferAttribute(indices, 1));
-  return merged;
-}
-
 export default function SentryDiscoBall() {
   return (
     <>
       <color attach="background" args={["#08050e"]} />
-
-      <ambientLight intensity={0.6} />
-      <directionalLight position={[5, 5, 8]} intensity={4} color="#ffffff" />
-
-      <spotLight
-        position={[4, 4, 8]}
-        intensity={180}
-        angle={0.5}
-        penumbra={0.4}
-        color="#ffffff"
-        castShadow
-      />
-      <spotLight
-        position={[-5, 3, 6]}
-        intensity={100}
-        angle={0.6}
-        penumbra={0.6}
-        color="#d8b4fe"
-      />
-      <spotLight
-        position={[2, -3, 6]}
-        intensity={60}
-        angle={0.7}
-        penumbra={0.7}
-        color="#a78bfa"
-      />
-      <spotLight
-        position={[0, 2, -6]}
-        intensity={50}
-        angle={0.8}
-        penumbra={0.9}
-        color="#7c3aed"
-      />
-      <pointLight position={[-3, -3, 5]} intensity={30} color="#c4b5fd" />
-      <pointLight position={[3, 3, 5]} intensity={30} color="#ffffff" />
-
+      <ambientLight intensity={1.0} />
+      <directionalLight position={[5, 5, 8]} intensity={5} color="#ffffff" />
+      <spotLight position={[4, 4, 8]} intensity={200} angle={0.5} penumbra={0.4} color="#ffffff" />
+      <spotLight position={[-5, 3, 6]} intensity={120} angle={0.6} penumbra={0.6} color="#d8b4fe" />
+      <spotLight position={[2, -3, 6]} intensity={80} angle={0.7} penumbra={0.7} color="#a78bfa" />
+      <pointLight position={[-3, -3, 5]} intensity={40} color="#c4b5fd" />
+      <pointLight position={[3, 3, 5]} intensity={40} color="#ffffff" />
       <SentryLogoMesh />
-
       <Environment preset="city" />
     </>
   );

@@ -1,5 +1,6 @@
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
+import * as THREE from "three";
 import SentryDiscoBall from "./SentryDiscoBall";
 
 function App() {
@@ -7,7 +8,7 @@ function App() {
     <main className="app">
       <Canvas
         camera={{ position: [0, 0, 7], fov: 50 }}
-        gl={{ antialias: true, toneMapping: 3 }}
+        gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping }}
         dpr={[1, 2]}
       >
         <SentryDiscoBall />
