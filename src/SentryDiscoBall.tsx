@@ -5,8 +5,8 @@ import * as THREE from "three";
 import { SVGLoader } from "three/examples/jsm/loaders/SVGLoader.js";
 
 const DEPTH = 0.6;
-const TILE_SIZE = 0.1;
-const TILE_GAP = 0.012;
+const TILE_SIZE = 0.09;
+const TILE_GAP = 0.01;
 const SVG_SCALE = 0.1;
 
 const SENTRY_SVG_PATH =
@@ -16,164 +16,232 @@ function parseSentryShapes(): THREE.Shape[] {
   const loader = new SVGLoader();
   const svgData = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 44"><path d="${SENTRY_SVG_PATH}"/></svg>`;
   const data = loader.parse(svgData);
-
   const shapes: THREE.Shape[] = [];
   for (const path of data.paths) {
-    const pathShapes = SVGLoader.createShapes(path);
-    shapes.push(...pathShapes);
+    shapes.push(...SVGLoader.createShapes(path));
   }
   return shapes;
 }
 
-function isPointInShapes(
-  px: number,
-  py: number,
-  polygons: THREE.Vector2[][]
-): boolean {
-  for (const poly of polygons) {
-    if (isPointInPolygon(px, py, poly)) return true;
+function buildExtrudedGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
+  const extrudeSettings: THREE.ExtrudeGeometryOptions = {
+    depth: DEPTH / SVG_SCALE,
+    bevelEnabled: true,
+    bevelThickness: 0.25,
+    bevelSize: 0.25,
+    bevelSegments: 2,
+  };
+
+  const geos: THREE.ExtrudeGeometry[] = [];
+  for (const shape of shapes) {
+    geos.push(new THREE.ExtrudeGeometry(shape, extrudeSettings));
   }
-  return false;
+  const merged = mergeBufferGeometries(geos);
+  geos.forEach((g) => g.dispose());
+
+  merged.scale(SVG_SCALE, -SVG_SCALE, SVG_SCALE);
+  merged.computeBoundingBox();
+  const box = merged.boundingBox!;
+  merged.translate(
+    -(box.min.x + box.max.x) / 2,
+    -(box.min.y + box.max.y) / 2,
+    -(box.min.z + box.max.z) / 2
+  );
+  merged.computeVertexNormals();
+  return merged;
 }
 
-function isPointInPolygon(
-  px: number,
-  py: number,
-  polygon: THREE.Vector2[]
-): boolean {
-  let inside = false;
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const xi = polygon[i].x,
-      yi = polygon[i].y;
-    const xj = polygon[j].x,
-      yj = polygon[j].y;
-    if (yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
-      inside = !inside;
-    }
-  }
-  return inside;
-}
-
-function shapesToPolygons(shapes: THREE.Shape[]): THREE.Vector2[][] {
-  return shapes.map((shape) => shape.getPoints(120));
-}
-
-function generateTileMatrices(
-  shapes: THREE.Shape[],
-  centerX: number,
-  centerY: number
+/**
+ * Group triangles into coplanar face clusters, then tile each cluster
+ * with a uniform grid. This avoids per-triangle tiling issues and
+ * produces consistent tile coverage across the entire surface.
+ */
+function generateTilesFromGeometry(
+  geometry: THREE.BufferGeometry
 ): THREE.Matrix4[] {
-  const matrices: THREE.Matrix4[] = [];
-  const tileStep = TILE_SIZE + TILE_GAP;
-  const halfDepth = DEPTH / 2;
-  const polygons = shapesToPolygons(shapes);
+  const pos = geometry.getAttribute("position");
+  const idx = geometry.index;
+  if (!pos || !idx) return [];
 
-  // Bounding box in scaled SVG coordinates
-  let minX = Infinity,
-    maxX = -Infinity,
-    minY = Infinity,
-    maxY = -Infinity;
-  for (const poly of polygons) {
-    for (const p of poly) {
-      minX = Math.min(minX, p.x * SVG_SCALE);
-      maxX = Math.max(maxX, p.x * SVG_SCALE);
-      minY = Math.min(minY, p.y * SVG_SCALE);
-      maxY = Math.max(maxY, p.y * SVG_SCALE);
-    }
+  const step = TILE_SIZE + TILE_GAP;
+
+  interface Face {
+    verts: [THREE.Vector3, THREE.Vector3, THREE.Vector3];
+    normal: THREE.Vector3;
+    center: THREE.Vector3;
   }
 
-  // Scale polygons for hit testing in world space
-  const scaledPolygons = polygons.map((poly) =>
-    poly.map((p) => new THREE.Vector2(p.x * SVG_SCALE, p.y * SVG_SCALE))
-  );
+  const faces: Face[] = [];
+  const va = new THREE.Vector3();
+  const vb = new THREE.Vector3();
+  const vc = new THREE.Vector3();
 
-  // --- Front face (normal +Z) ---
-  for (let x = minX; x <= maxX; x += tileStep) {
-    for (let y = minY; y <= maxY; y += tileStep) {
-      if (!isPointInShapes(x, y, scaledPolygons)) continue;
-      const mat = new THREE.Matrix4();
-      mat.compose(
-        new THREE.Vector3(x - centerX, -(y - centerY), halfDepth + 0.004),
-        new THREE.Quaternion(),
-        new THREE.Vector3(TILE_SIZE, TILE_SIZE, 1)
-      );
-      matrices.push(mat);
-    }
+  for (let i = 0; i < idx.count; i += 3) {
+    va.fromBufferAttribute(pos, idx.getX(i));
+    vb.fromBufferAttribute(pos, idx.getX(i + 1));
+    vc.fromBufferAttribute(pos, idx.getX(i + 2));
+
+    // Use geometric face normal (cross product), not smooth vertex normals
+    const edge1 = new THREE.Vector3().subVectors(vb, va);
+    const edge2 = new THREE.Vector3().subVectors(vc, va);
+    const faceNorm = new THREE.Vector3().crossVectors(edge1, edge2);
+    const area = faceNorm.length();
+    if (area < 1e-8) continue;
+    faceNorm.normalize();
+
+    const center = new THREE.Vector3()
+      .addVectors(va, vb)
+      .add(vc)
+      .divideScalar(3);
+
+    faces.push({
+      verts: [va.clone(), vb.clone(), vc.clone()],
+      normal: faceNorm,
+      center: center,
+    });
   }
 
-  // --- Back face (normal -Z) ---
-  const backQ = new THREE.Quaternion().setFromAxisAngle(
-    new THREE.Vector3(0, 1, 0),
-    Math.PI
-  );
-  for (let x = minX; x <= maxX; x += tileStep) {
-    for (let y = minY; y <= maxY; y += tileStep) {
-      if (!isPointInShapes(x, y, scaledPolygons)) continue;
-      const mat = new THREE.Matrix4();
-      mat.compose(
-        new THREE.Vector3(x - centerX, -(y - centerY), -halfDepth - 0.004),
-        backQ,
-        new THREE.Vector3(TILE_SIZE, TILE_SIZE, 1)
-      );
-      matrices.push(mat);
+  // Group faces into coplanar clusters: same normal AND same plane offset
+  const clusters: Face[][] = [];
+  const assigned = new Array(faces.length).fill(false);
+  const normalThreshold = 0.985;
+  const planeDistThreshold = 0.015;
+
+  for (let i = 0; i < faces.length; i++) {
+    if (assigned[i]) continue;
+    const cluster: Face[] = [faces[i]];
+    assigned[i] = true;
+    const refNormal = faces[i].normal;
+    const refPlaneDist = faces[i].center.dot(refNormal);
+
+    for (let j = i + 1; j < faces.length; j++) {
+      if (assigned[j]) continue;
+      if (refNormal.dot(faces[j].normal) < normalThreshold) continue;
+      const planeDist = Math.abs(faces[j].center.dot(refNormal) - refPlaneDist);
+      if (planeDist > planeDistThreshold) continue;
+      cluster.push(faces[j]);
+      assigned[j] = true;
     }
+    clusters.push(cluster);
   }
 
-  // --- Side faces (along outlines) ---
-  for (const poly of scaledPolygons) {
-    for (let i = 0; i < poly.length; i++) {
-      const a = poly[i];
-      const b = poly[(i + 1) % poly.length];
-      const eDx = b.x - a.x;
-      const eDy = b.y - a.y;
-      const eLen = Math.sqrt(eDx * eDx + eDy * eDy);
-      if (eLen < 0.001) continue;
+  // For each cluster, build a local 2D coordinate frame and tile it
+  const allMatrices: THREE.Matrix4[] = [];
+  const globalPlaced = new Set<string>();
 
-      // Outward normal (2D perpendicular)
-      const nx = -eDy / eLen;
-      const ny = eDx / eLen;
+  for (const cluster of clusters) {
+    if (cluster.length === 0) continue;
 
-      const tilesAlongEdge = Math.max(1, Math.round(eLen / tileStep));
-      const tilesAlongDepth = Math.max(1, Math.round(DEPTH / tileStep));
+    // Average normal for the cluster
+    const avgNormal = new THREE.Vector3();
+    for (const f of cluster) avgNormal.add(f.normal);
+    avgNormal.normalize();
 
-      const edgeTileW = (eLen / tilesAlongEdge) * (TILE_SIZE / tileStep);
-      const edgeTileH = (DEPTH / tilesAlongDepth) * (TILE_SIZE / tileStep);
+    // Build tangent frame
+    const up =
+      Math.abs(avgNormal.y) > 0.99
+        ? new THREE.Vector3(1, 0, 0)
+        : new THREE.Vector3(0, 1, 0);
+    const tangent = new THREE.Vector3().crossVectors(up, avgNormal).normalize();
+    const bitangent = new THREE.Vector3()
+      .crossVectors(avgNormal, tangent)
+      .normalize();
 
-      for (let ei = 0; ei < tilesAlongEdge; ei++) {
-        const t = (ei + 0.5) / tilesAlongEdge;
-        const ex = a.x + eDx * t - centerX;
-        const ey = -(a.y + eDy * t - centerY);
+    // Project all triangle vertices into 2D and collect triangles
+    const tris2d: { a: THREE.Vector2; b: THREE.Vector2; c: THREE.Vector2 }[] = [];
+    let minU = Infinity,
+      maxU = -Infinity,
+      minV = Infinity,
+      maxV = -Infinity;
 
-        for (let di = 0; di < tilesAlongDepth; di++) {
-          const dt = (di + 0.5) / tilesAlongDepth;
-          const ez = -halfDepth + DEPTH * dt;
+    const refPoint = cluster[0].center;
+    for (const face of cluster) {
+      const pts2d: THREE.Vector2[] = [];
+      for (const v of face.verts) {
+        const rel = new THREE.Vector3().subVectors(v, refPoint);
+        const u = rel.dot(tangent);
+        const vv = rel.dot(bitangent);
+        pts2d.push(new THREE.Vector2(u, vv));
+        minU = Math.min(minU, u);
+        maxU = Math.max(maxU, u);
+        minV = Math.min(minV, vv);
+        maxV = Math.max(maxV, vv);
+      }
+      tris2d.push({ a: pts2d[0], b: pts2d[1], c: pts2d[2] });
+    }
 
-          const px = ex + nx * 0.004;
-          const py = ey - ny * 0.004;
+    // Snap grid to global alignment
+    const startU = Math.floor(minU / step) * step;
+    const startV = Math.floor(minV / step) * step;
 
-          const angle = Math.atan2(-ny, nx);
-          const q = new THREE.Quaternion()
-            .setFromAxisAngle(new THREE.Vector3(0, 0, 1), angle)
-            .multiply(
-              new THREE.Quaternion().setFromAxisAngle(
-                new THREE.Vector3(0, 1, 0),
-                Math.PI / 2
-              )
-            );
+    // Build rotation quaternion for tiles on this cluster
+    const lookTarget = new THREE.Vector3().addVectors(refPoint, avgNormal);
+    const lookMat = new THREE.Matrix4().lookAt(
+      refPoint,
+      lookTarget,
+      Math.abs(avgNormal.y) > 0.99
+        ? new THREE.Vector3(0, 0, 1)
+        : new THREE.Vector3(0, 1, 0)
+    );
+    const quat = new THREE.Quaternion().setFromRotationMatrix(lookMat);
 
-          const mat = new THREE.Matrix4();
-          mat.compose(
-            new THREE.Vector3(px, py, ez),
-            q,
-            new THREE.Vector3(edgeTileH, edgeTileW, 1)
-          );
-          matrices.push(mat);
+    for (let u = startU; u <= maxU; u += step) {
+      for (let v = startV; v <= maxV; v += step) {
+        const pt2d = new THREE.Vector2(u, v);
+        let insideAny = false;
+        for (const tri of tris2d) {
+          if (pointInTriangle2D(pt2d, tri.a, tri.b, tri.c)) {
+            insideAny = true;
+            break;
+          }
         }
+        if (!insideAny) continue;
+
+        // Convert back to 3D
+        const worldPos = new THREE.Vector3()
+          .copy(refPoint)
+          .addScaledVector(tangent, u)
+          .addScaledVector(bitangent, v)
+          .addScaledVector(avgNormal, 0.003);
+
+        // Deduplicate (tiles at cluster boundaries)
+        const kx = Math.round(worldPos.x * 500);
+        const ky = Math.round(worldPos.y * 500);
+        const kz = Math.round(worldPos.z * 500);
+        const key = `${kx},${ky},${kz}`;
+        if (globalPlaced.has(key)) continue;
+        globalPlaced.add(key);
+
+        const mat = new THREE.Matrix4();
+        mat.compose(
+          worldPos,
+          quat,
+          new THREE.Vector3(TILE_SIZE, TILE_SIZE, 1)
+        );
+        allMatrices.push(mat);
       }
     }
   }
 
-  return matrices;
+  return allMatrices;
+}
+
+function pointInTriangle2D(
+  p: THREE.Vector2,
+  a: THREE.Vector2,
+  b: THREE.Vector2,
+  c: THREE.Vector2
+): boolean {
+  const d1 = sign(p, a, b);
+  const d2 = sign(p, b, c);
+  const d3 = sign(p, c, a);
+  const hasNeg = d1 < 0 || d2 < 0 || d3 < 0;
+  const hasPos = d1 > 0 || d2 > 0 || d3 > 0;
+  return !(hasNeg && hasPos);
+}
+
+function sign(p1: THREE.Vector2, p2: THREE.Vector2, p3: THREE.Vector2): number {
+  return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
 }
 
 function SentryLogoMesh() {
@@ -182,52 +250,9 @@ function SentryLogoMesh() {
 
   const { matrices, solidGeo } = useMemo(() => {
     const shapes = parseSentryShapes();
-
-    // Build extruded base geometry
-    const extrudeSettings: THREE.ExtrudeGeometryOptions = {
-      depth: DEPTH / SVG_SCALE,
-      bevelEnabled: true,
-      bevelThickness: 0.3,
-      bevelSize: 0.3,
-      bevelSegments: 3,
-    };
-
-    const geos: THREE.ExtrudeGeometry[] = [];
-    for (const shape of shapes) {
-      geos.push(new THREE.ExtrudeGeometry(shape, extrudeSettings));
-    }
-    const merged = mergeBufferGeometries(geos);
-    geos.forEach((g) => g.dispose());
-
-    // Scale and center
-    merged.scale(SVG_SCALE, -SVG_SCALE, SVG_SCALE);
-    merged.computeBoundingBox();
-    const box = merged.boundingBox!;
-    const cx = (box.min.x + box.max.x) / 2;
-    const cy = (box.min.y + box.max.y) / 2;
-    const cz = (box.min.z + box.max.z) / 2;
-    merged.translate(-cx, -cy, -cz);
-    merged.computeVertexNormals();
-
-    // Compute center in scaled SVG space for tile generation
-    let sMinX = Infinity,
-      sMaxX = -Infinity,
-      sMinY = Infinity,
-      sMaxY = -Infinity;
-    for (const shape of shapes) {
-      const pts = shape.getPoints(120);
-      for (const p of pts) {
-        sMinX = Math.min(sMinX, p.x * SVG_SCALE);
-        sMaxX = Math.max(sMaxX, p.x * SVG_SCALE);
-        sMinY = Math.min(sMinY, p.y * SVG_SCALE);
-        sMaxY = Math.max(sMaxY, p.y * SVG_SCALE);
-      }
-    }
-    const centerX = (sMinX + sMaxX) / 2;
-    const centerY = (sMinY + sMaxY) / 2;
-
-    const mats = generateTileMatrices(shapes, centerX, centerY);
-    return { matrices: mats, solidGeo: merged };
+    const geo = buildExtrudedGeometry(shapes);
+    const mats = generateTilesFromGeometry(geo);
+    return { matrices: mats, solidGeo: geo };
   }, []);
 
   useEffect(() => {
@@ -298,7 +323,7 @@ function mergeBufferGeometries(
   for (const g of geometries) {
     const p = g.getAttribute("position");
     const n = g.getAttribute("normal");
-    const idx = g.index;
+    const gIdx = g.index;
 
     for (let i = 0; i < p.count; i++) {
       positions[(vertexOffset + i) * 3] = p.getX(i);
@@ -311,11 +336,11 @@ function mergeBufferGeometries(
       }
     }
 
-    if (idx) {
-      for (let i = 0; i < idx.count; i++) {
-        indices[indexOffset + i] = idx.getX(i) + vertCount;
+    if (gIdx) {
+      for (let i = 0; i < gIdx.count; i++) {
+        indices[indexOffset + i] = gIdx.getX(i) + vertCount;
       }
-      indexOffset += idx.count;
+      indexOffset += gIdx.count;
     }
 
     vertCount += p.count;
