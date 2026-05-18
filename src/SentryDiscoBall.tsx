@@ -21,7 +21,7 @@ function parseSentryShapes(): THREE.Shape[] {
   return shapes;
 }
 
-function buildExtrudedGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
+function buildGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
   const extrudeSettings: THREE.ExtrudeGeometryOptions = {
     depth: DEPTH / SVG_SCALE,
     bevelEnabled: true,
@@ -34,7 +34,7 @@ function buildExtrudedGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
   for (const shape of shapes) {
     geos.push(new THREE.ExtrudeGeometry(shape, extrudeSettings));
   }
-  const merged = mergeBufferGeometries(geos);
+  const merged = mergeGeometries(geos);
   geos.forEach((g) => g.dispose());
 
   merged.scale(SVG_SCALE, -SVG_SCALE, SVG_SCALE);
@@ -49,135 +49,153 @@ function buildExtrudedGeometry(shapes: THREE.Shape[]): THREE.BufferGeometry {
   return merged;
 }
 
-function createDiscoMaterial(): THREE.MeshPhysicalMaterial {
-  const mat = new THREE.MeshPhysicalMaterial({
-    color: new THREE.Color("#9b7ed0"),
-    metalness: 1.0,
-    roughness: 0.03,
-    reflectivity: 1.0,
-    clearcoat: 1.0,
-    clearcoatRoughness: 0.02,
-    envMapIntensity: 2.5,
-    side: THREE.DoubleSide,
-  });
+/**
+ * Generate a grid-pattern texture that creates the disco tile look.
+ * Each cell is bright (white) with thin dark borders (grooves).
+ */
+function createTileTexture(
+  resolution: number,
+  gridCells: number,
+  grooveFraction: number
+): THREE.CanvasTexture {
+  const canvas = document.createElement("canvas");
+  canvas.width = resolution;
+  canvas.height = resolution;
+  const ctx = canvas.getContext("2d")!;
 
-  mat.onBeforeCompile = (shader) => {
-    shader.uniforms.tileSize = { value: 0.09 };
-    shader.uniforms.grooveWidth = { value: 0.007 };
+  const cellSize = resolution / gridCells;
+  const grooveSize = cellSize * grooveFraction;
 
-    // Add varyings to vertex shader
-    shader.vertexShader = shader.vertexShader.replace(
-      "void main() {",
-      `
-      varying vec3 vWorldPos;
-      varying vec3 vWorldNorm;
-      void main() {
-      `
-    );
-    shader.vertexShader = shader.vertexShader.replace(
-      "#include <worldpos_vertex>",
-      `
-      #include <worldpos_vertex>
-      vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
-      vWorldNorm = normalize(mat3(modelMatrix) * normal);
-      `
-    );
+  // Fill background with groove color
+  ctx.fillStyle = "#0a0714";
+  ctx.fillRect(0, 0, resolution, resolution);
 
-    // Inject tile pattern into fragment shader
-    shader.fragmentShader = shader.fragmentShader.replace(
-      "void main() {",
-      `
-      uniform float tileSize;
-      uniform float grooveWidth;
-      varying vec3 vWorldPos;
-      varying vec3 vWorldNorm;
+  // Draw bright tile cells
+  ctx.fillStyle = "#ffffff";
+  for (let gx = 0; gx < gridCells; gx++) {
+    for (let gy = 0; gy < gridCells; gy++) {
+      const x = gx * cellSize + grooveSize / 2;
+      const y = gy * cellSize + grooveSize / 2;
+      const s = cellSize - grooveSize;
 
-      float discoTilePattern(vec3 pos, vec3 norm) {
-        vec3 absN = abs(norm);
-        vec2 uv;
-        if (absN.z >= absN.x && absN.z >= absN.y) {
-          uv = pos.xy;
-        } else if (absN.x >= absN.y) {
-          uv = pos.yz;
-        } else {
-          uv = pos.xz;
-        }
-        vec2 cell = fract(uv / tileSize);
-        float hg = grooveWidth / tileSize * 0.5;
-        float gx = smoothstep(0.0, hg, cell.x) * smoothstep(0.0, hg, 1.0 - cell.x);
-        float gy = smoothstep(0.0, hg, cell.y) * smoothstep(0.0, hg, 1.0 - cell.y);
-        return gx * gy;
-      }
+      // Slightly rounded corners for a nicer look
+      const r = Math.min(s * 0.08, 3);
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + s - r, y);
+      ctx.quadraticCurveTo(x + s, y, x + s, y + r);
+      ctx.lineTo(x + s, y + s - r);
+      ctx.quadraticCurveTo(x + s, y + s, x + s - r, y + s);
+      ctx.lineTo(x + r, y + s);
+      ctx.quadraticCurveTo(x, y + s, x, y + s - r);
+      ctx.lineTo(x, y + r);
+      ctx.quadraticCurveTo(x, y, x + r, y);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
 
-      // Per-tile normal variation for disco ball shimmer
-      vec3 perturbNormal(vec3 norm, vec3 pos) {
-        vec3 absN = abs(norm);
-        vec2 uv;
-        if (absN.z >= absN.x && absN.z >= absN.y) uv = pos.xy;
-        else if (absN.x >= absN.y) uv = pos.yz;
-        else uv = pos.xz;
-        vec2 cellId = floor(uv / tileSize);
-        float h1 = fract(sin(dot(cellId, vec2(127.1, 311.7))) * 43758.5453);
-        float h2 = fract(sin(dot(cellId, vec2(269.5, 183.3))) * 43758.5453);
-        return normalize(norm + 0.06 * vec3(h1 - 0.5, h2 - 0.5, 0.0));
-      }
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  return tex;
+}
 
-      void main() {
-      `
-    );
+/**
+ * Build a custom UV attribute based on triplanar projection:
+ * for each vertex, pick the two world-space axes most perpendicular
+ * to the vertex normal, and use them as UV coordinates.
+ */
+function applyTriplanarUVs(
+  geometry: THREE.BufferGeometry,
+  tilesPerUnit: number
+) {
+  const pos = geometry.getAttribute("position");
+  const norm = geometry.getAttribute("normal");
+  const count = pos.count;
+  const uvs = new Float32Array(count * 2);
 
-    // After normal mapping, perturb the normal per-tile for varied reflections
-    shader.fragmentShader = shader.fragmentShader.replace(
-      "#include <normal_fragment_maps>",
-      `
-      #include <normal_fragment_maps>
-      normal = perturbNormal(vWorldNorm, vWorldPos);
-      `
-    );
+  for (let i = 0; i < count; i++) {
+    const nx = Math.abs(norm.getX(i));
+    const ny = Math.abs(norm.getY(i));
+    const nz = Math.abs(norm.getZ(i));
 
-    // Modify diffuse color and roughness based on tile pattern
-    shader.fragmentShader = shader.fragmentShader.replace(
-      "#include <color_fragment>",
-      `
-      #include <color_fragment>
-      float tileMask = discoTilePattern(vWorldPos, vWorldNorm);
-      // Grooves: dark and rough. Tiles: bright and mirror-like.
-      vec3 grooveCol = vec3(0.02, 0.015, 0.03);
-      diffuseColor.rgb = mix(grooveCol, diffuseColor.rgb, tileMask);
-      `
-    );
+    let u: number, v: number;
+    if (nz >= nx && nz >= ny) {
+      // Front/back: use XY
+      u = pos.getX(i);
+      v = pos.getY(i);
+    } else if (nx >= ny) {
+      // Left/right: use YZ
+      u = pos.getY(i);
+      v = pos.getZ(i);
+    } else {
+      // Top/bottom: use XZ
+      u = pos.getX(i);
+      v = pos.getZ(i);
+    }
 
-    // Also vary roughness: grooves are matte, tiles are mirror
-    shader.fragmentShader = shader.fragmentShader.replace(
-      "#include <roughnessmap_fragment>",
-      `
-      #include <roughnessmap_fragment>
-      roughnessFactor = mix(0.9, roughnessFactor, tileMask);
-      `
-    );
+    uvs[i * 2] = u * tilesPerUnit;
+    uvs[i * 2 + 1] = v * tilesPerUnit;
+  }
 
-    // Vary metalness too
-    shader.fragmentShader = shader.fragmentShader.replace(
-      "#include <metalnessmap_fragment>",
-      `
-      #include <metalnessmap_fragment>
-      metalnessFactor = mix(0.1, metalnessFactor, tileMask);
-      `
-    );
-  };
-
-  return mat;
+  geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
 }
 
 function SentryLogoMesh() {
   const groupRef = useRef<THREE.Group>(null);
 
-  const geometry = useMemo(() => {
+  const { geometry, tileTexture, roughnessTexture } = useMemo(() => {
     const shapes = parseSentryShapes();
-    return buildExtrudedGeometry(shapes);
-  }, []);
+    const geo = buildGeometry(shapes);
 
-  const material = useMemo(() => createDiscoMaterial(), []);
+    // Tile scale: how many tiles per world unit
+    const tilesPerUnit = 1 / 0.09;
+    applyTriplanarUVs(geo, tilesPerUnit);
+
+    // Color/alpha texture for the tile pattern
+    const tileTex = createTileTexture(1024, 1, 0.06);
+    tileTex.repeat.set(1, 1);
+
+    // Roughness map: tiles are smooth (dark=low roughness), grooves are rough (bright=high roughness)
+    const roughCanvas = document.createElement("canvas");
+    roughCanvas.width = 256;
+    roughCanvas.height = 256;
+    const rctx = roughCanvas.getContext("2d")!;
+    const cellSize = 256;
+    const grooveSize = cellSize * 0.06;
+
+    // Grooves are rough (white = high roughness)
+    rctx.fillStyle = "#ffffff";
+    rctx.fillRect(0, 0, 256, 256);
+
+    // Tiles are smooth (black = low roughness)
+    rctx.fillStyle = "#0a0a0a";
+    const x = grooveSize / 2;
+    const y = grooveSize / 2;
+    const s = cellSize - grooveSize;
+    const r = Math.min(s * 0.08, 6);
+    rctx.beginPath();
+    rctx.moveTo(x + r, y);
+    rctx.lineTo(x + s - r, y);
+    rctx.quadraticCurveTo(x + s, y, x + s, y + r);
+    rctx.lineTo(x + s, y + s - r);
+    rctx.quadraticCurveTo(x + s, y + s, x + s - r, y + s);
+    rctx.lineTo(x + r, y + s);
+    rctx.quadraticCurveTo(x, y + s, x, y + s - r);
+    rctx.lineTo(x, y + r);
+    rctx.quadraticCurveTo(x, y, x + r, y);
+    rctx.closePath();
+    rctx.fill();
+
+    const roughTex = new THREE.CanvasTexture(roughCanvas);
+    roughTex.wrapS = THREE.RepeatWrapping;
+    roughTex.wrapT = THREE.RepeatWrapping;
+
+    return { geometry: geo, tileTexture: tileTex, roughnessTexture: roughTex };
+  }, []);
 
   useFrame((_, delta) => {
     if (groupRef.current) {
@@ -187,12 +205,25 @@ function SentryLogoMesh() {
 
   return (
     <group ref={groupRef}>
-      <mesh geometry={geometry} material={material} />
+      <mesh geometry={geometry}>
+        <meshPhysicalMaterial
+          color="#9b7ed0"
+          map={tileTexture}
+          roughnessMap={roughnessTexture}
+          metalness={1.0}
+          roughness={0.03}
+          reflectivity={1.0}
+          clearcoat={1.0}
+          clearcoatRoughness={0.02}
+          envMapIntensity={2.5}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
     </group>
   );
 }
 
-function mergeBufferGeometries(
+function mergeGeometries(
   geometries: THREE.BufferGeometry[]
 ): THREE.BufferGeometry {
   let totalVerts = 0;
